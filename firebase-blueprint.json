@@ -1,0 +1,136 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private profile record for an authenticated VoxDub AI user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the user."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "User display name."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Verified user email address (PII, owner-only)."
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Optional profile avatar URL."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was first created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was last updated."
+        }
+      },
+      "required": ["uid", "displayName", "email", "createdAt", "updatedAt"]
+    },
+    "DubbingProject": {
+      "title": "DubbingProject",
+      "description": "Saved VoxDub AI project containing translation settings, subtitle styles, and word-timestamped segments.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique project document identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the user who owns this project."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180,
+          "description": "Video or project display title."
+        },
+        "sourceLanguage": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 16,
+          "description": "Source language code."
+        },
+        "targetLanguage": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 16,
+          "description": "Target translation language code."
+        },
+        "voiceStyle": {
+          "type": "string",
+          "enum": ["male_pro", "female_friendly", "narrator_casual"],
+          "description": "Selected AI dubbing voice persona."
+        },
+        "durationSeconds": {
+          "type": "number",
+          "description": "Duration of the source media in seconds."
+        },
+        "subtitleStyle": {
+          "type": "object",
+          "description": "Subtitle visual appearance configuration including dynamic caption mode."
+        },
+        "segments": {
+          "type": "array",
+          "description": "Bounded list (max 200) of transcript/translation segments with word-level timestamps."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when project was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when project was last updated."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "sourceLanguage",
+        "targetLanguage",
+        "voiceStyle",
+        "durationSeconds",
+        "subtitleStyle",
+        "segments",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile documents restricted strictly to the owning authenticated user."
+    },
+    "/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/DubbingProject" },
+      "description": "User-owned VoxDub AI dubbing and subtitle projects."
+    }
+  }
+}
