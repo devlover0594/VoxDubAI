@@ -1,6 +1,6 @@
 services:
   voxdubai:
-    image: teknisionline/voxdub:latest
+    image: ghcr.io/devlover0594/voxdubai:latest
     ports:
       - "${HOST_PORT:-3000}:3000"
     env_file:

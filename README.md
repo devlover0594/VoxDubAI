@@ -17,6 +17,6 @@ Project persistence continues to use the Firebase configuration already included
 
 ## Published images
 
-GitHub Actions publishes `teknisionline/voxdub:sha-<commit>` for each pushed branch commit. Commits on the repository's default branch also update `teknisionline/voxdub:latest`; the Compose file tracks this tag.
+GitHub Actions publishes `ghcr.io/devlover0594/voxdubai:sha-<commit>` for each pushed branch commit. Commits on the repository's default branch also update `ghcr.io/devlover0594/voxdubai:latest`; the Compose file tracks this tag.
 
-For publishing, add the Docker Hub account's `DOCKERHUB_USERNAME` and an access token as repository Actions secrets named `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in GitHub Settings. The workflow does not change Docker Hub repository visibility. If the repository is private, users need to authenticate with `docker login`; the repository owner can make it public in Docker Hub settings to allow anonymous pulls.
+The workflow publishes to GitHub Container Registry (GHCR) using the repository-provided `GITHUB_TOKEN` with `packages: write`; no registry credentials need to be added as Actions secrets. The workflow does not change package visibility. If the GHCR package is private, users need to authenticate with `docker login ghcr.io`; the package owner can make it public in the package settings to allow anonymous pulls.
