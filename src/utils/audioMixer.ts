@@ -85,10 +85,11 @@ export function createSynthesizedDemoWavUrl(
 }
 
 /**
- * Convert base64 WAV returned by server into an Object URL and measure its duration.
+ * Convert base64 audio (WAV/MP3/OGG) returned by server into an Object URL and measure its duration.
  */
 export async function base64WavToObjectUrl(
-  base64: string
+  base64: string,
+  mimeType = 'audio/wav'
 ): Promise<{ url: string; duration: number }> {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -96,7 +97,7 @@ export async function base64WavToObjectUrl(
   for (let i = 0; i < len; i++) {
     bytes[i] = binaryString.charCodeAt(i);
   }
-  const blob = new Blob([bytes], { type: 'audio/wav' });
+  const blob = new Blob([bytes], { type: mimeType || 'audio/wav' });
   const url = URL.createObjectURL(blob);
 
   const duration = await measureAudioDuration(url);

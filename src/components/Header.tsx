@@ -4,12 +4,13 @@ import {
   AudioWaveform,
   CheckCircle2,
   Cloud,
+  Cpu,
   FolderOpen,
   LogIn,
   LogOut,
   Upload,
 } from 'lucide-react';
-import type { ApiHealthStatus } from '../types/dubbing';
+import type { AiProviderId, ApiHealthStatus } from '../types/dubbing';
 
 interface HeaderProps {
   apiHealth: ApiHealthStatus;
@@ -23,6 +24,9 @@ interface HeaderProps {
   onOpenProjects: () => void;
   onSaveProject: () => void;
   onTriggerUpload: () => void;
+  onOpenAiSettings: () => void;
+  activeAiLabel: string;
+  activeProvider: AiProviderId;
   isBusy: boolean;
 }
 
@@ -38,6 +42,9 @@ export function Header({
   onOpenProjects,
   onSaveProject,
   onTriggerUpload,
+  onOpenAiSettings,
+  activeAiLabel,
+  activeProvider,
   isBusy,
 }: HeaderProps) {
   return (
@@ -61,7 +68,12 @@ export function Header({
           className="hidden lg:flex items-center gap-1.5 text-xs text-slate-300 mr-1"
           aria-live="polite"
         >
-          {!apiHealth.checked ? (
+          {activeProvider !== 'gemini_server' ? (
+            <>
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" aria-hidden="true" />
+              <span className="text-slate-300 whitespace-nowrap">Provider AI Kustom</span>
+            </>
+          ) : !apiHealth.checked ? (
             <span className="text-slate-400 whitespace-nowrap">Memeriksa API...</span>
           ) : apiHealth.apiKeyConfigured ? (
             <>
@@ -75,6 +87,18 @@ export function Header({
             </>
           )}
         </div>
+
+        <button
+          type="button"
+          onClick={onOpenAiSettings}
+          aria-label="Pengaturan AI Provider dan Model"
+          title={`Provider AI: ${activeAiLabel}`}
+          className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-lg bg-[#1A1E2E] hover:bg-[#23283D] border border-white/10 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0"
+        >
+          <Cpu className="w-3.5 h-3.5 text-indigo-400 shrink-0" aria-hidden="true" />
+          <span className="hidden md:inline max-w-[160px] truncate">{activeAiLabel}</span>
+          <span className="md:hidden">AI</span>
+        </button>
 
         {!authLoading &&
           (user ? (

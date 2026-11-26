@@ -1,13 +1,39 @@
 import 'dotenv/config';
+import { execFile } from 'child_process';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { promisify } from 'util';
 import multer from 'multer';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
-import { createServer as createViteServer } from 'vite';
+import { GoogleGenAI, Type } from '@google/genai';
+import {
+  analyzeMediaWithOpenAiCompatible,
+  buildCandidateList,
+  createGeminiClientForConfig,
+  fetchProviderModels,
+  fixGrammarWithProvider,
+  getProviderDisplayName,
+  mapProviderError,
+  parseAiConfigFromRequest,
+  parseFallbackConfigsFromRequest,
+  runWithServerFallback,
+  synthesizeTtsWithProvider,
+  transcribeAudioWithProvider,
+  translateTextWithProvider,
+  TtsUnsupportedByProviderError,
+  type AiProviderRequestConfig,
+} from './server/aiProviders.ts';
+import { resolveAnalysisModelSelection } from './src/utils/aiRouting.ts';
+import {
+  buildFfmpegRenderArgs,
+  getMp4DownloadFilename,
+  mapLangToIso639_2,
+  normalizeSubtitleRenderMode,
+  type RenderAudioMixMode,
+} from './src/utils/mp4RenderConfig.ts';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const MAX_FILE_SIZE_BYTES = 80 * 1024 * 1024; // 80 MB limit
 const INLINE_THRESHOLD_BYTES = 15 * 1024 * 1024; // 15 MB threshold for inlineData vs File API
 
@@ -53,20 +79,6 @@ const VOICE_MAP: Record<string, { voiceName: string; style: string }> = {
     style: 'Relaxed, engaging, conversational casual narrator dubbing voice',
   },
 };
-
-function getGeminiClient(apiVersion = 'v1beta'): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) return null;
-  return new GoogleGenAI({
-    apiKey,
-    apiVersion,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
 
 function normalizeMimeType(mimeType: string, originalName: string): string {
   const cleanMime = (mimeType || '').split(';')[0].trim().toLowerCase();
@@ -119,67 +131,6 @@ function parseSecondsServer(val: unknown): number {
     if (!Number.isNaN(n) && n >= 0) return n;
   }
   return 0;
-}
-
-function mapGeminiError(err: unknown): { status: number; message: string } {
-  const raw = err instanceof Error ? err.message : String(err);
-  const lower = raw.toLowerCase();
-
-  if (
-    lower.includes('api_key_invalid') ||
-    lower.includes('permission_denied') ||
-    lower.includes('api key not valid') ||
-    lower.includes('403')
-  ) {
-    return {
-      status: 403,
-      message:
-        'API Key Gemini tidak valid atau belum memiliki izin. Periksa pengaturan API Key Anda di panel Settings > Secrets.',
-    };
-  }
-
-  if (
-    lower.includes('resource_exhausted') ||
-    lower.includes('quota') ||
-    lower.includes('429')
-  ) {
-    return {
-      status: 429,
-      message:
-        'Kuota permintaan Gemini API sedang penuh (rate limit). Tunggu beberapa saat lalu coba lagi.',
-    };
-  }
-
-  if (
-    lower.includes('entity too large') ||
-    lower.includes('payload too large') ||
-    lower.includes('request entity too large') ||
-    /\b413\b/.test(lower)
-  ) {
-    return {
-      status: 413,
-      message:
-        'Ukuran media terlalu besar untuk diproses sekaligus. Coba unggah video di bawah 80 MB atau potong durasinya.',
-    };
-  }
-
-  if (
-    lower.includes('unavailable') ||
-    lower.includes('high demand') ||
-    lower.includes('overloaded') ||
-    /\b503\b/.test(lower)
-  ) {
-    return {
-      status: 503,
-      message:
-        'Layanan Gemini API sedang sibuk sementara (503). Tunggu beberapa detik lalu coba lagi.',
-    };
-  }
-
-  return {
-    status: 500,
-    message: `Gagal memproses permintaan AI: ${raw}`,
-  };
 }
 
 const upload = multer({
@@ -281,6 +232,21 @@ async function startServer() {
     });
   });
 
+  app.post('/api/ai/fetch-models', async (req: Request, res: Response) => {
+    try {
+      const cfg = parseAiConfigFromRequest(req.body);
+      const models = await fetchProviderModels({
+        provider: cfg.provider,
+        baseUrl: cfg.baseUrl,
+        apiKey: cfg.apiKey,
+      });
+      res.json({ models });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal mengambil daftar model AI.';
+      res.status(400).json({ error: msg });
+    }
+  });
+
   app.post('/api/analyze', upload.single('media'), async (req: Request, res: Response) => {
     const file = req.file;
     if (!file) {
@@ -288,14 +254,9 @@ async function startServer() {
       return;
     }
 
-    const ai = getGeminiClient('v1beta');
-    if (!ai) {
-      await fs.promises.unlink(file.path).catch(() => {});
-      res.status(400).json({
-        error: 'GEMINI_API_KEY belum dikonfigurasi di server. Atur di panel Settings > Secrets.',
-      });
-      return;
-    }
+    const aiConfig = parseAiConfigFromRequest(req.body?.aiConfig);
+    const fallbackConfigs = parseFallbackConfigsFromRequest(req.body?.fallbackConfigs);
+    const candidates = buildCandidateList(aiConfig, fallbackConfigs);
 
     const sourceLang = typeof req.body?.sourceLanguage === 'string' ? req.body.sourceLanguage : 'auto';
     const targetLang = typeof req.body?.targetLanguage === 'string' ? req.body.targetLanguage : 'id';
@@ -303,94 +264,20 @@ async function startServer() {
     const targetLabel = LANGUAGE_LABELS[targetLang] ?? targetLang;
     const mimeType = normalizeMimeType(file.mimetype, file.originalname);
 
-    let uploadedFileName: string | null = null;
-
-    try {
-      let mediaPart: Record<string, unknown>;
-
-      if (file.size <= INLINE_THRESHOLD_BYTES) {
-        const buffer = await fs.promises.readFile(file.path);
-        mediaPart = {
-          inlineData: {
-            mimeType,
-            data: buffer.toString('base64'),
-          },
+    const normalizeAnalyzedSegments = (rawList: unknown[]) =>
+      rawList.map((rawItem, idx) => {
+        const item = (rawItem ?? {}) as {
+          id?: unknown;
+          startTime?: unknown;
+          endTime?: unknown;
+          originalText?: unknown;
+          translatedText?: unknown;
+          words?: unknown;
         };
-      } else {
-        const uploaded = await ai.files.upload({
-          file: file.path,
-          config: { mimeType },
-        });
-        uploadedFileName = uploaded.name ?? null;
-
-        let currentFile = uploaded;
-        const startPoll = Date.now();
-        while (currentFile.state === 'PROCESSING') {
-          if (Date.now() - startPoll > 90000) {
-            throw new Error('Waktu pemrosesan file di Gemini File API habis.');
-          }
-          await new Promise((r) => setTimeout(r, 2000));
-          if (!currentFile.name) break;
-          currentFile = await ai.files.get({ name: currentFile.name });
-        }
-
-        if (currentFile.state === 'FAILED') {
-          throw new Error('Gemini File API gagal memproses file media ini.');
-        }
-
-        mediaPart = {
-          fileData: {
-            mimeType: currentFile.mimeType || mimeType,
-            fileUri: currentFile.uri,
-          },
-        };
-      }
-
-      const systemInstruction = [
-        'You are an expert audiovisual translator and dubbing script adapter.',
-        'Transcribe all spoken dialogue accurately into chronological segments with numeric startTime and endTime in seconds.',
-        'Translate each segment into the requested target language naturally.',
-        'CRITICAL DUBBING CONSTRAINT: Adjust the phrasing and syllable count of translatedText so that when spoken aloud at a normal pace, it fits proportionally inside (endTime - startTime).',
-        'CRITICAL WORD-LEVEL TIMESTAMPS: Include a "words" array for EVERY word in translatedText, with exact numeric "start" and "end" timestamps in seconds strictly ordered inside [startTime, endTime].',
-      ].join(' ');
-
-      const promptText = `Analyze this media. Source language hint: ${sourceLabel}. Target translation language: ${targetLabel}. Return the structured JSON array of segments including word-level timestamps ("words") for translatedText.`;
-
-      let response;
-      try {
-        response = await runAnalyzeWithModel(
-          ai,
-          'gemini-2.5-flash',
-          mediaPart,
-          promptText,
-          systemInstruction
-        );
-      } catch (primaryErr) {
-        const msg = primaryErr instanceof Error ? primaryErr.message.toLowerCase() : '';
-        if (msg.includes('not_found') || msg.includes('404') || msg.includes('not found')) {
-          response = await runAnalyzeWithModel(
-            ai,
-            'gemini-4-hydrogen',
-            mediaPart,
-            promptText,
-            systemInstruction
-          );
-        } else {
-          throw primaryErr;
-        }
-      }
-
-      const rawText = (response.text ?? '[]').trim();
-      const parsed = JSON.parse(rawText);
-      if (!Array.isArray(parsed)) {
-        throw new Error('Format respons Gemini tidak berupa array segmen.');
-      }
-
-      const segments = parsed.map((item, idx) => {
-        const startSec = parseSecondsServer(item?.startTime);
-        const rawEnd = parseSecondsServer(item?.endTime);
+        const startSec = parseSecondsServer(item.startTime);
+        const rawEnd = parseSecondsServer(item.endTime);
         const endSec = rawEnd > startSec ? rawEnd : startSec + 2.5;
-        const words = Array.isArray(item?.words)
+        const words = Array.isArray(item.words)
           ? item.words
               .filter((w: unknown) => w && typeof (w as { word?: unknown }).word === 'string')
               .map((w: { word: string; start?: number; end?: number }) => {
@@ -405,30 +292,168 @@ async function startServer() {
           : [];
 
         return {
-          id: typeof item?.id === 'number' ? item.id : idx + 1,
+          id: typeof item.id === 'number' ? item.id : idx + 1,
           startTime: formatSecondsToTimestampServer(startSec),
           endTime: formatSecondsToTimestampServer(endSec),
-          originalText: typeof item?.originalText === 'string' ? item.originalText.trim() : '',
-          translatedText: typeof item?.translatedText === 'string' ? item.translatedText.trim() : '',
+          originalText: typeof item.originalText === 'string' ? item.originalText.trim() : '',
+          translatedText: typeof item.translatedText === 'string' ? item.translatedText.trim() : '',
           words,
         };
       });
 
-      res.json({ segments });
+    const analyzeWithSingleCandidate = async (candidate: AiProviderRequestConfig) => {
+      const resolvedModel = resolveAnalysisModelSelection({
+        provider: candidate.provider,
+        requestedModel: candidate.model,
+        hasMediaAttachment: true,
+      });
+
+      if (candidate.provider !== 'gemini_server' && candidate.provider !== 'gemini_custom') {
+        const rawSegments = await analyzeMediaWithOpenAiCompatible({
+          filePath: file.path,
+          fileSize: file.size,
+          originalName: file.originalname,
+          mimeType,
+          sourceLabel,
+          targetLabel,
+          aiConfig: { ...candidate, model: resolvedModel },
+        });
+        return {
+          segments: normalizeAnalyzedSegments(rawSegments),
+          usedModel: resolvedModel,
+        };
+      }
+
+      const ai = await createGeminiClientForConfig(candidate);
+      if (!ai) {
+        throw new Error('GEMINI_API_KEY belum dikonfigurasi di server. Atur di panel Settings > Secrets.');
+      }
+
+      let uploadedFileName: string | null = null;
+      try {
+        let mediaPart: Record<string, unknown>;
+
+        if (file.size <= INLINE_THRESHOLD_BYTES) {
+          const buffer = await fs.promises.readFile(file.path);
+          mediaPart = {
+            inlineData: {
+              mimeType,
+              data: buffer.toString('base64'),
+            },
+          };
+        } else {
+          const uploaded = await ai.files.upload({
+            file: file.path,
+            config: { mimeType },
+          });
+          uploadedFileName = uploaded.name ?? null;
+
+          let currentFile = uploaded;
+          const startPoll = Date.now();
+          while (currentFile.state === 'PROCESSING') {
+            if (Date.now() - startPoll > 90000) {
+              throw new Error('Waktu pemrosesan file di Gemini File API habis.');
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+            if (!currentFile.name) break;
+            currentFile = await ai.files.get({ name: currentFile.name });
+          }
+
+          if (currentFile.state === 'FAILED') {
+            throw new Error('Gemini File API gagal memproses file media ini.');
+          }
+
+          mediaPart = {
+            fileData: {
+              mimeType: currentFile.mimeType || mimeType,
+              fileUri: currentFile.uri,
+            },
+          };
+        }
+
+        const systemInstruction = [
+          'You are an expert audiovisual translator and dubbing script adapter.',
+          'Transcribe all spoken dialogue accurately into chronological segments with numeric startTime and endTime in seconds.',
+          'Translate each segment into the requested target language naturally.',
+          'CRITICAL DUBBING CONSTRAINT: Adjust the phrasing and syllable count of translatedText so that when spoken aloud at a normal pace, it fits proportionally inside (endTime - startTime).',
+          'CRITICAL WORD-LEVEL TIMESTAMPS: Include a "words" array for EVERY word in translatedText, with exact numeric "start" and "end" timestamps in seconds strictly ordered inside [startTime, endTime].',
+        ].join(' ');
+
+        const promptText = `Analyze this media. Source language hint: ${sourceLabel}. Target translation language: ${targetLabel}. Return the structured JSON array of segments including word-level timestamps ("words") for translatedText.`;
+
+        let usedAnalyzeModel = resolvedModel;
+        let response;
+        try {
+          response = await runAnalyzeWithModel(
+            ai,
+            resolvedModel,
+            mediaPart,
+            promptText,
+            systemInstruction
+          );
+        } catch (primaryErr) {
+          const msg = primaryErr instanceof Error ? primaryErr.message.toLowerCase() : '';
+          if (
+            candidate.provider === 'gemini_server' &&
+            (msg.includes('not_found') || msg.includes('404') || msg.includes('not found'))
+          ) {
+            usedAnalyzeModel = 'gemini-4-hydrogen';
+            response = await runAnalyzeWithModel(
+              ai,
+              usedAnalyzeModel,
+              mediaPart,
+              promptText,
+              systemInstruction
+            );
+          } else {
+            throw primaryErr;
+          }
+        }
+
+        const rawText = (response.text ?? '[]').trim();
+        const parsed = JSON.parse(rawText);
+        if (!Array.isArray(parsed)) {
+          throw new Error('Format respons Gemini tidak berupa array segmen.');
+        }
+
+        return {
+          segments: normalizeAnalyzedSegments(parsed),
+          usedModel: usedAnalyzeModel,
+        };
+      } finally {
+        if (uploadedFileName) {
+          await ai.files.delete({ name: uploadedFileName }).catch(() => {});
+        }
+      }
+    };
+
+    try {
+      const outcome = await runWithServerFallback(candidates, (candidate) =>
+        analyzeWithSingleCandidate(candidate)
+      );
+      res.json({
+        segments: outcome.result.segments,
+        usedModel: outcome.result.usedModel,
+        usedProvider: getProviderDisplayName(outcome.usedConfig.provider),
+        fallbackUsed: outcome.fallbackUsed,
+        attemptCount: outcome.attemptIndex + 1,
+      });
     } catch (err) {
-      const mapped = mapGeminiError(err);
-      res.status(mapped.status).json({ error: mapped.message });
+      const httpStatus = (err as { httpStatus?: number }).httpStatus;
+      if (httpStatus) {
+        res.status(httpStatus).json({ error: err instanceof Error ? err.message : String(err) });
+      } else {
+        const mapped = mapProviderError(err, aiConfig.provider);
+        res.status(mapped.status).json({ error: mapped.message });
+      }
     } finally {
       await fs.promises.unlink(file.path).catch(() => {});
-      if (uploadedFileName) {
-        await ai.files.delete({ name: uploadedFileName }).catch(() => {});
-      }
     }
   });
 
   /**
-   * Microphone Audio Transcription using gemini-3.5-transcribe
-   * Optionally translates the transcript into targetLanguage with word-level timestamps.
+   * Microphone Audio Transcription using the active AI provider + Auto-Fallback
+   * Optionally translates the transcript into targetLanguage.
    */
   app.post('/api/transcribe-mic', upload.single('audio'), async (req: Request, res: Response) => {
     const file = req.file;
@@ -437,82 +462,69 @@ async function startServer() {
       return;
     }
 
-    const ai = getGeminiClient('v1beta');
-    if (!ai) {
-      await fs.promises.unlink(file.path).catch(() => {});
-      res.status(400).json({
-        error: 'GEMINI_API_KEY belum dikonfigurasi di server.',
-      });
-      return;
-    }
+    const aiConfig = parseAiConfigFromRequest(req.body?.aiConfig);
+    const fallbackConfigs = parseFallbackConfigsFromRequest(req.body?.fallbackConfigs);
+    const candidates = buildCandidateList(aiConfig, fallbackConfigs);
 
     const targetLang = typeof req.body?.targetLanguage === 'string' ? req.body.targetLanguage : 'id';
     const targetLabel = LANGUAGE_LABELS[targetLang] ?? targetLang;
     const mimeType = normalizeMimeType(file.mimetype, file.originalname || 'mic.webm');
 
     try {
-      const buffer = await fs.promises.readFile(file.path);
-      const audioPart = {
-        inlineData: {
+      const outcome = await runWithServerFallback(candidates, async (candidate) => {
+        const transcript = await transcribeAudioWithProvider({
+          filePath: file.path,
+          originalName: file.originalname || 'mic.webm',
           mimeType,
-          data: buffer.toString('base64'),
-        },
-      };
-
-      const transcribeResponse = await ai.models.generateContent({
-        model: 'gemini-3.5-transcribe',
-        contents: {
-          parts: [audioPart, { text: 'Transcribe this audio accurately.' }],
-        },
-      });
-
-      const transcript = (transcribeResponse.text ?? '').trim();
-      if (!transcript) {
-        res.status(422).json({
-          error: 'Tidak ada ucapan yang terdengar pada rekaman mikrofon. Coba rekam ulang dengan suara lebih jelas.',
+          aiConfig: candidate,
         });
-        return;
-      }
 
-      // Translate transcript into targetLanguage cleanly
-      let translatedText = transcript;
-      try {
-        const translateRes = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Translate the following spoken transcript naturally into ${targetLabel}. Return only the translated sentence without quotes or commentary:\n\n${transcript}`,
-        });
-        const translatedCandidate = (translateRes.text ?? '').trim();
-        if (translatedCandidate) {
-          translatedText = translatedCandidate;
+        if (!transcript) {
+          throw new Error(
+            'Tidak ada ucapan yang terdengar pada rekaman mikrofon. Coba rekam ulang dengan suara lebih jelas.'
+          );
         }
-      } catch {
-        // Keep transcript as fallback if translation fails
-      }
+
+        let translatedText = transcript;
+        try {
+          translatedText = await translateTextWithProvider({
+            text: transcript,
+            langLabel: targetLabel,
+            aiConfig: candidate,
+          });
+        } catch {
+          // Keep transcript as fallback if translation fails
+        }
+
+        return { transcript, translatedText };
+      });
 
       res.json({
-        transcript,
-        translatedText,
+        transcript: outcome.result.transcript,
+        translatedText: outcome.result.translatedText,
+        usedProvider: getProviderDisplayName(outcome.usedConfig.provider),
+        fallbackUsed: outcome.fallbackUsed,
       });
     } catch (err) {
-      const mapped = mapGeminiError(err);
-      res.status(mapped.status).json({ error: mapped.message });
+      const httpStatus = (err as { httpStatus?: number }).httpStatus;
+      if (httpStatus) {
+        res.status(httpStatus).json({ error: err instanceof Error ? err.message : String(err) });
+      } else {
+        const mapped = mapProviderError(err, aiConfig.provider);
+        res.status(mapped.status).json({ error: mapped.message });
+      }
     } finally {
       await fs.promises.unlink(file.path).catch(() => {});
     }
   });
 
   app.post('/api/fix-grammar', async (req: Request, res: Response) => {
-    const ai = getGeminiClient('v1beta');
-    if (!ai) {
-      res.status(400).json({
-        error: 'GEMINI_API_KEY belum dikonfigurasi di server.',
-      });
-      return;
-    }
-
     const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
     const originalText = typeof req.body?.originalText === 'string' ? req.body.originalText.trim() : '';
     const targetLanguage = typeof req.body?.targetLanguage === 'string' ? req.body.targetLanguage : 'id';
+    const aiConfig = parseAiConfigFromRequest(req.body?.aiConfig);
+    const fallbackConfigs = parseFallbackConfigsFromRequest(req.body?.fallbackConfigs);
+    const candidates = buildCandidateList(aiConfig, fallbackConfigs);
 
     if (!text) {
       res.status(400).json({ error: 'Teks terjemahan kosong, tidak ada yang dapat diperbaiki.' });
@@ -527,89 +539,34 @@ async function startServer() {
     const langLabel = LANGUAGE_LABELS[targetLanguage] ?? targetLanguage;
 
     try {
-      const systemInstruction = [
-        `You are a strict, accurate proofreader and copyeditor for ${langLabel} video dubbing scripts.`,
-        'Fix only spelling mistakes, typos, punctuation, and grammatical errors in the provided translated text.',
-        'Preserve the exact meaning, natural spoken tone, and approximate syllable length/conciseness so it still fits the same dubbing timestamp window.',
-        'Do not add commentary, extra sentences, or surrounding quotation marks. If the text is already grammatically correct, return it unchanged.',
-      ].join(' ');
-
-      const promptParts = [
-        `Target language: ${langLabel}`,
-        originalText ? `Source reference (for context only): ${originalText}` : '',
-        `Translated text to proofread and fix:\n${text}`,
-      ].filter(Boolean);
-
-      const promptContent = promptParts.join('\n\n');
-      const runFixWithModel = (modelName: string) =>
-        ai.models.generateContent({
-          model: modelName,
-          contents: promptContent,
-          config: {
-            systemInstruction,
-            ...(modelName === 'gemini-4-hydrogen'
-              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-              : {}),
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                correctedText: {
-                  type: Type.STRING,
-                  description: 'The spelling- and grammar-corrected version of the translated text.',
-                },
-              },
-              required: ['correctedText'],
-            },
-          },
-        });
-
-      let response;
-      try {
-        response = await runFixWithModel('gemini-4-hydrogen');
-      } catch (primaryErr) {
-        const msg = primaryErr instanceof Error ? primaryErr.message.toLowerCase() : '';
-        const isTransient =
-          msg.includes('503') ||
-          msg.includes('unavailable') ||
-          msg.includes('high demand') ||
-          msg.includes('not_found') ||
-          msg.includes('404');
-        if (isTransient) {
-          await new Promise((r) => setTimeout(r, 700));
-          try {
-            response = await runFixWithModel('gemini-3.1-flash-lite');
-          } catch {
-            await new Promise((r) => setTimeout(r, 1200));
-            response = await runFixWithModel('gemini-4-hydrogen');
-          }
-        } else {
-          throw primaryErr;
-        }
-      }
-
-      const raw = (response.text ?? '{}').trim();
-      const parsed = JSON.parse(raw) as { correctedText?: unknown };
-      const correctedText =
-        typeof parsed.correctedText === 'string' && parsed.correctedText.trim()
-          ? parsed.correctedText.trim()
-          : text;
-
-      res.json({ correctedText });
+      const outcome = await runWithServerFallback(candidates, (candidate) =>
+        fixGrammarWithProvider({
+          text,
+          originalText,
+          langLabel,
+          aiConfig: candidate,
+        })
+      );
+      res.json({
+        correctedText: outcome.result,
+        usedProvider: getProviderDisplayName(outcome.usedConfig.provider),
+        fallbackUsed: outcome.fallbackUsed,
+      });
     } catch (err) {
-      const mapped = mapGeminiError(err);
-      res.status(mapped.status).json({ error: mapped.message });
+      const httpStatus = (err as { httpStatus?: number }).httpStatus;
+      if (httpStatus) {
+        res.status(httpStatus).json({ error: err instanceof Error ? err.message : String(err) });
+      } else {
+        const mapped = mapProviderError(err, aiConfig.provider);
+        res.status(mapped.status).json({ error: mapped.message });
+      }
     }
   });
 
   app.post('/api/tts', async (req: Request, res: Response) => {
-    const ai = getGeminiClient('v1beta');
-    if (!ai) {
-      res.status(400).json({
-        error: 'GEMINI_API_KEY belum dikonfigurasi di server.',
-      });
-      return;
-    }
+    const aiConfig = parseAiConfigFromRequest(req.body?.aiConfig);
+    const fallbackConfigs = parseFallbackConfigsFromRequest(req.body?.fallbackConfigs);
+    const candidates = buildCandidateList(aiConfig, fallbackConfigs);
 
     const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
     const voiceStyle = typeof req.body?.voiceStyle === 'string' ? req.body.voiceStyle : 'male_pro';
@@ -628,96 +585,234 @@ async function startServer() {
     const voiceProfile = VOICE_MAP[voiceStyle] ?? VOICE_MAP.male_pro;
     const langLabel = LANGUAGE_LABELS[targetLanguage] ?? targetLanguage;
 
-    const extractBase64Audio = (response: Awaited<ReturnType<typeof ai.models.generateContent>>) => {
-      const parts = response.candidates?.[0]?.content?.parts ?? [];
-      for (const part of parts) {
-        if (part.inlineData?.data) {
-          return {
-            data: part.inlineData.data,
-            mimeType: part.inlineData.mimeType || 'audio/wav',
-          };
-        }
-      }
-      return null;
-    };
+    const attemptErrors: Array<{ status: number; message: string; label: string }> = [];
+    let lastUnsupportedErr: TtsUnsupportedByProviderError | null = null;
 
-    try {
-      let response;
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
       try {
-        response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash-lite-tts',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text,
-                  speechMetadata: {
-                    style: `${voiceProfile.style}, spoken naturally in ${langLabel}`,
-                  },
-                },
-              ],
-            },
-          ],
-          config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: voiceProfile.voiceName,
-                },
-              },
-            },
-          },
+        const audioResult = await synthesizeTtsWithProvider({
+          text,
+          voiceStyle,
+          langLabel,
+          voiceProfile,
+          aiConfig: candidate,
         });
-      } catch (primaryErr) {
-        const msg = primaryErr instanceof Error ? primaryErr.message.toLowerCase() : '';
-        if (msg.includes('speechmetadata') || msg.includes('unknown name') || msg.includes('not_found') || msg.includes('404')) {
-          const fallbackModel =
-            msg.includes('not_found') || msg.includes('404')
-              ? 'gemini-2.5-flash-preview-tts'
-              : 'gemini-3.8-flash-lite-tts';
-          response = await ai.models.generateContent({
-            model: fallbackModel,
-            contents: [
-              {
-                role: 'user',
-                parts: [{ text }],
-              },
-            ],
-            config: {
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: {
-                    voiceName: voiceProfile.voiceName,
-                  },
-                },
-              },
-            },
-          });
-        } else {
-          throw primaryErr;
-        }
-      }
 
-      const audioResult = extractBase64Audio(response);
-      if (!audioResult) {
-        res.status(502).json({
-          error: 'Model TTS tidak mengembalikan data audio. Silakan coba lagi.',
+        res.json({
+          audioBase64: audioResult.audioBase64,
+          mimeType: audioResult.mimeType,
+          usedModel: audioResult.usedModel,
+          usedProvider: getProviderDisplayName(candidate.provider),
+          fallbackUsed: i > 0,
+          attemptCount: i + 1,
+        });
+        return;
+      } catch (err) {
+        if (err instanceof TtsUnsupportedByProviderError) {
+          lastUnsupportedErr = err;
+          continue;
+        }
+        const mapped = mapProviderError(err, candidate.provider);
+        attemptErrors.push({
+          status: mapped.status,
+          message: mapped.message,
+          label: getProviderDisplayName(candidate.provider),
+        });
+      }
+    }
+
+    if (attemptErrors.length === 0 && lastUnsupportedErr) {
+      res.status(200).json({
+        audioBase64: null,
+        unsupportedTts: true,
+        providerLabel: lastUnsupportedErr.providerLabel,
+        message: lastUnsupportedErr.message,
+      });
+      return;
+    }
+
+    const hasRetryable = attemptErrors.some((e) => e.status === 429 || e.status === 503);
+    const allClientOrAuth =
+      attemptErrors.length > 0 &&
+      attemptErrors.every((e) => e.status === 400 || e.status === 401 || e.status === 403);
+    const finalStatus = hasRetryable ? 429 : allClientOrAuth ? 403 : attemptErrors[0]?.status ?? 500;
+    const combinedMessage =
+      attemptErrors.length <= 1
+        ? attemptErrors[0]?.message || 'Gagal membuat audio dubbing.'
+        : `Semua ${attemptErrors.length} API/provider TTS gagal (${attemptErrors
+            .map((e, idx) => `[#${idx + 1} ${e.label}: ${e.message}]`)
+            .join(' | ')})`;
+
+    res.status(finalStatus).json({ error: combinedMessage });
+  });
+
+  const execFileAsync = promisify(execFile);
+
+  async function isFfmpegAvailable(): Promise<boolean> {
+    try {
+      await execFileAsync('ffmpeg', ['-version'], { timeout: 4000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function probeMediaStreams(
+    filePath: string
+  ): Promise<{ hasVideo: boolean; hasAudio: boolean; durationSeconds?: number }> {
+    try {
+      const { stdout } = await execFileAsync(
+        'ffprobe',
+        [
+          '-v',
+          'error',
+          '-show_entries',
+          'stream=codec_type:format=duration',
+          '-of',
+          'json',
+          filePath,
+        ],
+        { timeout: 10000 }
+      );
+      const parsed = JSON.parse(stdout || '{}') as {
+        streams?: Array<{ codec_type?: string }>;
+        format?: { duration?: string };
+      };
+      const types = (parsed.streams ?? [])
+        .map((s) => String(s.codec_type || '').trim().toLowerCase())
+        .filter(Boolean);
+      const parsedDuration = Number(parsed.format?.duration);
+      return {
+        hasVideo: types.includes('video'),
+        hasAudio: types.includes('audio'),
+        durationSeconds:
+          Number.isFinite(parsedDuration) && parsedDuration > 0
+            ? parsedDuration
+            : undefined,
+      };
+    } catch {
+      return { hasVideo: false, hasAudio: false };
+    }
+  }
+
+  app.post(
+    '/api/render-mp4',
+    upload.fields([
+      { name: 'media', maxCount: 1 },
+      { name: 'dubAudio', maxCount: 1 },
+    ]),
+    async (req: Request, res: Response) => {
+      const files = (req.files ?? {}) as Record<string, Express.Multer.File[]>;
+      const mediaFile = files.media?.[0];
+      const dubAudioFile = files.dubAudio?.[0];
+      const subtitleMode = normalizeSubtitleRenderMode(req.body?.subtitleMode);
+      const assContent =
+        typeof req.body?.assContent === 'string' ? req.body.assContent : '';
+      const srtContent =
+        typeof req.body?.srtContent === 'string' ? req.body.srtContent : '';
+      const targetLanguage =
+        typeof req.body?.targetLanguage === 'string' ? req.body.targetLanguage : 'id';
+      const rawAudioMixMode =
+        typeof req.body?.audioMixMode === 'string'
+          ? req.body.audioMixMode
+          : 'dubbed_only';
+      const audioMixMode: RenderAudioMixMode =
+        rawAudioMixMode === 'dubbed_with_bg' || rawAudioMixMode === 'original'
+          ? rawAudioMixMode
+          : 'dubbed_only';
+      const rawDuration = Number(req.body?.durationSeconds);
+      const safeDuration =
+        Number.isFinite(rawDuration) && rawDuration > 0
+          ? Math.min(3600, Math.max(1, rawDuration))
+          : 15;
+
+      const cleanupUploaded = async () => {
+        if (mediaFile) await fs.promises.unlink(mediaFile.path).catch(() => {});
+        if (dubAudioFile) await fs.promises.unlink(dubAudioFile.path).catch(() => {});
+      };
+
+      if (!(await isFfmpegAvailable())) {
+        await cleanupUploaded();
+        res.status(501).json({
+          ffmpegUnavailable: true,
+          error: 'FFmpeg tidak tersedia di server; menggunakan renderer browser.',
         });
         return;
       }
 
-      res.json({
-        audioBase64: audioResult.data,
-        mimeType: audioResult.mimeType,
-      });
-    } catch (err) {
-      const mapped = mapGeminiError(err);
-      res.status(mapped.status).json({ error: mapped.message });
+      let jobDir: string | null = null;
+      try {
+        jobDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'voxdub-mp4-'));
+        const hasAss = subtitleMode === 'hardsub' && assContent.trim().length > 0;
+        if (hasAss) {
+          await fs.promises.writeFile(
+            path.join(jobDir, 'subtitles.ass'),
+            assContent,
+            'utf8'
+          );
+        }
+
+        const hasSrt = subtitleMode === 'softsub' && srtContent.trim().length > 0;
+        const srtFilePath = hasSrt ? path.join(jobDir, 'subtitles.srt') : undefined;
+        if (srtFilePath) {
+          await fs.promises.writeFile(srtFilePath, srtContent, 'utf8');
+        }
+
+        const streams = mediaFile
+          ? await probeMediaStreams(mediaFile.path)
+          : { hasVideo: false, hasAudio: false };
+
+        const targetDuration =
+          mediaFile && streams.hasVideo && streams.durationSeconds
+            ? Math.min(3600, Math.max(1, streams.durationSeconds))
+            : safeDuration;
+
+        const outPath = path.join(jobDir, 'output.mp4');
+        const args = buildFfmpegRenderArgs({
+          mediaFilePath: mediaFile?.path,
+          hasVideoStream: streams.hasVideo,
+          hasMediaAudioStream: streams.hasAudio,
+          dubAudioFilePath: dubAudioFile?.path,
+          audioMixMode,
+          subtitleMode,
+          hasAssFile: hasAss,
+          srtFilePath,
+          subtitleLanguageIso: mapLangToIso639_2(targetLanguage),
+          durationSeconds: targetDuration,
+          outputPath: outPath,
+        });
+
+        await execFileAsync('ffmpeg', args, {
+          cwd: jobDir,
+          timeout: 180000,
+          maxBuffer: 8 * 1024 * 1024,
+        });
+
+        const mp4Buffer = await fs.promises.readFile(outPath);
+        const downloadName = getMp4DownloadFilename(
+          typeof req.body?.title === 'string' ? req.body.title : 'voxdub',
+          subtitleMode
+        );
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${downloadName.replace(/"/g, '')}"`
+        );
+        res.send(mp4Buffer);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Gagal merender video MP4.';
+        res.status(500).json({ error: `Render video MP4 gagal: ${msg}` });
+      } finally {
+        await cleanupUploaded();
+        if (jobDir) {
+          await fs.promises
+            .rm(jobDir, { recursive: true, force: true })
+            .catch(() => {});
+        }
+      }
     }
-  });
+  );
 
   app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
     if (!req.path.startsWith('/api/')) {
@@ -747,6 +842,7 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

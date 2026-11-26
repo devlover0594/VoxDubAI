@@ -18,6 +18,7 @@ const STAGE_ORDER: Record<ProcessingStage, number> = {
   idle: 0,
   uploading: 1,
   analyzing: 2,
+  analyzed: 2,
   dubbing: 3,
   completed: 4,
   error: 0,
@@ -56,8 +57,15 @@ export function ProcessStepper({ stage, progressPercent, statusDetail }: Process
       <ol className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
         {STEPS.map((step) => {
           const isDone =
-            stage === 'completed' ? true : currentOrder > step.number;
-          const isActive = stage !== 'completed' && currentOrder === step.number;
+            stage === 'completed'
+              ? true
+              : stage === 'analyzed'
+              ? step.number <= 2
+              : currentOrder > step.number;
+          const isActive =
+            stage !== 'completed' &&
+            stage !== 'analyzed' &&
+            currentOrder === step.number;
 
           return (
             <li

@@ -113,7 +113,7 @@ service cloud.firestore {
     match /projects/{projectId} {
       allow get: if isVerifiedUser()
         && isValidId(projectId)
-        && existing().ownerId == request.auth.uid;
+        && (resource == null || existing().ownerId == request.auth.uid);
 
       allow list: if isVerifiedUser()
         && resource.data.ownerId == request.auth.uid;

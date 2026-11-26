@@ -1,6 +1,8 @@
 import {
   Clock,
+  Cpu,
   Download,
+  Film,
   Loader2,
   Plus,
   RefreshCw,
@@ -9,11 +11,13 @@ import {
   Volume2,
   Wand2,
 } from 'lucide-react';
+import type { RenderAudioMixMode } from '../utils/mp4ClientRenderer';
 import {
   SOURCE_LANGUAGES,
   TARGET_LANGUAGES,
   VOICE_STYLE_OPTIONS,
   type DubSegment,
+  type SubtitleRenderMode,
   type VoiceStyle,
 } from '../types/dubbing';
 import {
@@ -34,12 +38,19 @@ interface SegmentEditorProps {
   hasUploadedFile: boolean;
   isBusy: boolean;
   isExportingAudio: boolean;
+  isRenderingMp4: boolean;
+  renderProgress: { percent: number; detail: string } | null;
+  mp4AudioMixMode: RenderAudioMixMode;
+  onMp4AudioMixModeChange: (mode: RenderAudioMixMode) => void;
+  subtitleMode: SubtitleRenderMode;
+  onSubtitleModeChange: (mode: SubtitleRenderMode) => void;
   onSourceLanguageChange: (val: string) => void;
   onTargetLanguageChange: (val: string) => void;
   onVoiceStyleChange: (val: VoiceStyle) => void;
   onProcessVideo: () => void;
   onGenerateAllDubbing: () => void;
   onExportBundle: () => void;
+  onDownloadMp4: () => void;
   onSegmentChange: (id: number, patch: Partial<DubSegment>) => void;
   onSeekToSegment: (startTime: string | number) => void;
   onAutoFixGrammar: (id: number) => void;
@@ -47,6 +58,17 @@ interface SegmentEditorProps {
   onPlaySingleSegment: (seg: DubSegment) => void;
   onAddSegment: () => void;
   onDeleteSegment: (id: number) => void;
+  analysisProviderLabel: string;
+  analysisModelLabel: string;
+  analysisFallbackCount?: number;
+  ttsProviderLabel: string;
+  ttsModelLabel: string;
+  ttsFallbackCount?: number;
+  autoContinueTts: boolean;
+  onAutoContinueTtsChange: (val: boolean) => void;
+  isAnalyzing: boolean;
+  isDubbing: boolean;
+  onOpenAiSettings: () => void;
 }
 
 export function SegmentEditor({
@@ -59,12 +81,19 @@ export function SegmentEditor({
   hasUploadedFile,
   isBusy,
   isExportingAudio,
+  isRenderingMp4,
+  renderProgress,
+  mp4AudioMixMode,
+  onMp4AudioMixModeChange,
+  subtitleMode,
+  onSubtitleModeChange,
   onSourceLanguageChange,
   onTargetLanguageChange,
   onVoiceStyleChange,
   onProcessVideo,
   onGenerateAllDubbing,
   onExportBundle,
+  onDownloadMp4,
   onSegmentChange,
   onSeekToSegment,
   onAutoFixGrammar,
@@ -72,8 +101,21 @@ export function SegmentEditor({
   onPlaySingleSegment,
   onAddSegment,
   onDeleteSegment,
+  analysisProviderLabel,
+  analysisModelLabel,
+  analysisFallbackCount = 0,
+  ttsProviderLabel,
+  ttsModelLabel,
+  ttsFallbackCount = 0,
+  autoContinueTts,
+  onAutoContinueTtsChange,
+  isAnalyzing,
+  isDubbing,
+  onOpenAiSettings,
 }: SegmentEditorProps) {
-  const readyAudioCount = segments.filter((s) => Boolean(s.audioUrl)).length;
+  const readyAudioCount = segments.filter((s) =>
+    Boolean(s.audioUrl || s.useBrowserSpeech)
+  ).length;
 
   return (
     <section
@@ -82,6 +124,44 @@ export function SegmentEditor({
     >
       {/* Configuration Header */}
       <div className="p-4 sm:p-5 border-b border-white/8 space-y-5 bg-[#0E111A]">
+        <div className="flex flex-wrap items-start justify-between gap-2.5 pb-3 border-b border-white/8">
+          <div className="min-w-0 space-y-1">
+            <div className="text-[11px] font-medium text-slate-400">
+              Dual-Role Smart Auto-Routing
+            </div>
+            <div className="text-xs text-slate-200 truncate">
+              <span className="text-indigo-300 font-semibold">Analisis:</span>{' '}
+              <span>{analysisProviderLabel}</span>{' '}
+              <span className="text-slate-500">·</span>{' '}
+              <span className="font-mono text-indigo-200">{analysisModelLabel}</span>
+              {analysisFallbackCount > 0 && (
+                <span className="ml-1.5 text-[11px] text-amber-300">
+                  (+{analysisFallbackCount} fallback)
+                </span>
+              )}
+            </div>
+            <div className="text-xs text-slate-200 truncate">
+              <span className="text-emerald-300 font-semibold">TTS:</span>{' '}
+              <span>{ttsProviderLabel}</span>{' '}
+              <span className="text-slate-500">·</span>{' '}
+              <span className="font-mono text-emerald-200">{ttsModelLabel}</span>
+              {ttsFallbackCount > 0 && (
+                <span className="ml-1.5 text-[11px] text-amber-300">
+                  (+{ttsFallbackCount} fallback)
+                </span>
+              )}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onOpenAiSettings}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1A1E2E] hover:bg-[#23283D] border border-indigo-400/25 text-xs font-medium text-indigo-200 transition-colors whitespace-nowrap shrink-0"
+          >
+            <Cpu className="w-3.5 h-3.5 text-indigo-400" aria-hidden="true" />
+            <span>Atur Routing AI</span>
+          </button>
+        </div>
+
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
           <div>
             <label
@@ -158,7 +238,8 @@ export function SegmentEditor({
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-2.5 pt-1">
+        <div className="space-y-3 pt-1">
+          {/* Separated Stage 1 (Analysis) vs Stage 2 (Dubbing TTS) */}
           <div className="flex flex-wrap items-center gap-2">
             {hasUploadedFile && (
               <button
@@ -167,42 +248,134 @@ export function SegmentEditor({
                 disabled={isBusy}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-medium transition-colors whitespace-nowrap shrink-0"
               >
-                {isBusy ? (
+                {isAnalyzing ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
                 ) : (
                   <Wand2 className="w-3.5 h-3.5" aria-hidden="true" />
                 )}
-                <span>Analisis &amp; Dubbing Ulang</span>
+                <span>
+                  {isAnalyzing
+                    ? 'Menganalisis Video...'
+                    : segments.length > 0
+                    ? 'Analisis & Transkrip Ulang'
+                    : 'Analisis & Transkrip Video'}
+                </span>
               </button>
             )}
 
-            {segments.length > 0 && (
+            {(segments.length > 0 || hasUploadedFile) && (
               <button
                 type="button"
                 onClick={onGenerateAllDubbing}
-                disabled={isBusy}
-                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-[#1A1E2E] hover:bg-[#23283D] border border-white/10 disabled:opacity-50 disabled:cursor-not-allowed text-slate-200 text-xs font-medium transition-colors whitespace-nowrap shrink-0"
+                disabled={isBusy || segments.length === 0}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium transition-colors whitespace-nowrap shrink-0"
               >
-                <RefreshCw className="w-3.5 h-3.5 text-indigo-400" aria-hidden="true" />
-                <span>Generate Semua Audio TTS</span>
+                {isDubbing ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
+                )}
+                <span>
+                  {isDubbing ? 'Membuat Dubbing TTS...' : 'Generate Dubbing AI (TTS)'}
+                </span>
               </button>
             )}
           </div>
 
-          <button
-            type="button"
-            onClick={onExportBundle}
-            disabled={segments.length === 0 || isExportingAudio}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium transition-colors whitespace-nowrap shrink-0"
-          >
-            {isExportingAudio ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-            ) : (
-              <Download className="w-3.5 h-3.5" aria-hidden="true" />
+          {hasUploadedFile && (
+            <label className="inline-flex items-center gap-2 text-[11px] text-slate-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={autoContinueTts}
+                disabled={isBusy}
+                onChange={(e) => onAutoContinueTtsChange(e.target.checked)}
+                className="rounded border-white/20 bg-[#0B0D14] text-indigo-500 focus:ring-indigo-500"
+              />
+              <span>Otomatis lanjut ke Dubbing TTS setelah analisis selesai</span>
+            </label>
+          )}
+
+          <div className="flex flex-wrap items-center justify-between gap-2.5 pt-1 border-t border-white/6">
+            <div className="flex flex-wrap items-center gap-2">
+            {hasUploadedFile && (
+              <select
+                aria-label="Mode audio render MP4"
+                value={mp4AudioMixMode}
+                disabled={isRenderingMp4 || segments.length === 0}
+                onChange={(e) =>
+                  onMp4AudioMixModeChange(e.target.value as RenderAudioMixMode)
+                }
+                className="h-9 px-2.5 rounded-lg bg-[#0B0D14] border border-white/10 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-50"
+              >
+                <option value="dubbed_only">Voice-Over Penuh</option>
+                <option value="dubbed_with_bg">Voice-Over + 15% Audio Asli</option>
+                <option value="original">Audio Asli Saja</option>
+              </select>
             )}
-            <span>Export / Download Hasil</span>
-          </button>
+
+            <select
+              aria-label="Mode subtitle render MP4"
+              value={subtitleMode}
+              disabled={isRenderingMp4 || segments.length === 0}
+              onChange={(e) =>
+                onSubtitleModeChange(e.target.value as SubtitleRenderMode)
+              }
+              className="h-9 px-2.5 rounded-lg bg-[#0B0D14] border border-white/10 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-50"
+            >
+              <option value="hardsub">Hard Sub (Permanen)</option>
+              <option value="softsub">Soft Sub (Trek MP4)</option>
+              <option value="dubbing_only">Dubbing Only (Tanpa Sub)</option>
+            </select>
+
+            <button
+              type="button"
+              onClick={onDownloadMp4}
+              disabled={segments.length === 0 || isRenderingMp4 || isBusy}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium transition-colors whitespace-nowrap shrink-0"
+            >
+              {isRenderingMp4 ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+              ) : (
+                <Film className="w-3.5 h-3.5" aria-hidden="true" />
+              )}
+              <span>{isRenderingMp4 ? 'Merender MP4...' : 'Download Video (.MP4)'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onExportBundle}
+              disabled={segments.length === 0 || isExportingAudio}
+              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium transition-colors whitespace-nowrap shrink-0"
+            >
+              {isExportingAudio ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+              ) : (
+                <Download className="w-3.5 h-3.5" aria-hidden="true" />
+              )}
+              <span>Export Audio + SRT</span>
+            </button>
+          </div>
+          </div>
         </div>
+
+        {isRenderingMp4 && renderProgress && (
+          <div className="p-3 rounded-lg bg-[#0B0D14] border border-indigo-500/30 space-y-1.5">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="text-indigo-200 font-medium truncate">
+                {renderProgress.detail}
+              </span>
+              <span className="font-mono tabular-nums text-indigo-300 shrink-0">
+                {renderProgress.percent}%
+              </span>
+            </div>
+            <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+              <div
+                className="h-full bg-indigo-500 transition-all duration-200"
+                style={{ width: `${Math.max(4, Math.min(100, renderProgress.percent))}%` }}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Segment List Header */}
@@ -307,7 +480,7 @@ export function SegmentEditor({
                   </div>
 
                   <div className="flex items-center gap-1.5">
-                    {seg.audioUrl && (
+                    {(seg.audioUrl || seg.useBrowserSpeech) && (
                       <button
                         type="button"
                         onClick={() => onPlaySingleSegment(seg)}
@@ -331,7 +504,15 @@ export function SegmentEditor({
                       ) : (
                         <RefreshCw className="w-3.5 h-3.5 text-indigo-400" aria-hidden="true" />
                       )}
-                      <span>Regenerate Audio</span>
+                      <span>
+                        {seg.audioQueueStatus === 'queued'
+                          ? 'Dalam Antrian...'
+                          : seg.audioQueueStatus === 'retrying'
+                          ? `Ulang (${seg.audioRetryAttempt ?? 2}/${seg.audioMaxRetries ?? 5})`
+                          : seg.isGeneratingAudio
+                          ? 'Memproses...'
+                          : 'Regenerate Audio'}
+                      </span>
                     </button>
 
                     <button
@@ -376,6 +557,7 @@ export function SegmentEditor({
                         {seg.audioDuration ? (
                           <span className="font-mono text-[11px] tabular-nums text-slate-400">
                             Durasi audio: {seg.audioDuration.toFixed(1)}d
+                            {seg.useBrowserSpeech && ' · Web Speech'}
                             {parseTimestampToSeconds(seg.endTime) -
                               parseTimestampToSeconds(seg.startTime) <
                               seg.audioDuration && ' (otomatis dipercepat)'}
@@ -386,7 +568,7 @@ export function SegmentEditor({
                           onClick={() => onAutoFixGrammar(seg.id)}
                           disabled={seg.isFixingGrammar || !seg.translatedText.trim()}
                           aria-label={`Auto-Fix Grammar segmen ${index + 1}`}
-                          title="Perbaiki ejaan dan tata bahasa dengan Gemini tanpa mengubah timestamp"
+                          title="Perbaiki ejaan dan tata bahasa menggunakan AI Provider aktif tanpa mengubah timestamp"
                           className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#1A1E2E] hover:bg-[#23283D] border border-indigo-400/25 disabled:opacity-40 disabled:cursor-not-allowed text-[11px] font-medium text-indigo-200 transition-colors whitespace-nowrap"
                         >
                           {seg.isFixingGrammar ? (
@@ -442,9 +624,29 @@ export function SegmentEditor({
                   </div>
                 )}
 
+                {seg.audioQueueStatus === 'retrying' && (
+                  <p className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/25 rounded-md px-2.5 py-1.5">
+                    Antrian TTS menunggu jeda trafik — mencoba ulang otomatis (percobaan{' '}
+                    {seg.audioRetryAttempt ?? 2} dari {seg.audioMaxRetries ?? 5})...
+                  </p>
+                )}
+
+                {seg.audioQueueStatus === 'queued' && (
+                  <p className="text-xs text-indigo-200 bg-indigo-500/10 border border-indigo-500/25 rounded-md px-2.5 py-1.5">
+                    Menunggu antrian generasi suara TTS agar tidak terkena rate limit...
+                  </p>
+                )}
+
                 {seg.grammarError && (
                   <p className="text-xs text-rose-300 bg-rose-500/10 border border-rose-500/20 rounded-md px-2.5 py-1.5">
                     {seg.grammarError}
+                  </p>
+                )}
+
+                {seg.ttsUsedFallback && seg.ttsUsedProvider && (
+                  <p className="text-[11px] text-amber-300/90">
+                    Auto-Fallback TTS aktif: {seg.ttsUsedProvider}
+                    {seg.ttsUsedModel ? ` · ${seg.ttsUsedModel}` : ''}
                   </p>
                 )}
 

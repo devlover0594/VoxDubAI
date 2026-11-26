@@ -8,7 +8,12 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import type { AudioMode, DubSegment, SubtitleStyle } from '../types/dubbing';
+import type {
+  AudioMode,
+  DubSegment,
+  SubtitleRenderMode,
+  SubtitleStyle,
+} from '../types/dubbing';
 import { DEMO_SCENE_FRAMES, DEMO_VIDEO_TITLE } from '../data/demoProject';
 import {
   formatTimecodeShort,
@@ -27,6 +32,7 @@ interface VideoPreviewProps {
   audioMode: AudioMode;
   activeSegment: DubSegment | null;
   subtitleStyle: SubtitleStyle;
+  subtitleMode?: SubtitleRenderMode;
   showOriginalSubtitle: boolean;
   onToggleShowOriginalSubtitle: () => void;
   onTogglePlay: () => void;
@@ -64,6 +70,7 @@ export function VideoPreview({
   audioMode,
   activeSegment,
   subtitleStyle,
+  subtitleMode = 'hardsub',
   showOriginalSubtitle,
   onToggleShowOriginalSubtitle,
   onTogglePlay,
@@ -130,25 +137,33 @@ export function VideoPreview({
           )}
         </div>
 
-        {hasMedia && (
-          <button
-            type="button"
-            onClick={onToggleShowOriginalSubtitle}
-            className="text-xs text-slate-300 hover:text-white transition-colors whitespace-nowrap shrink-0 px-2 py-1 rounded hover:bg-white/5"
-          >
-            Teks Overlay: {showOriginalSubtitle ? 'Asli' : 'Terjemahan'}
-          </button>
-        )}
+        {hasMedia &&
+          (subtitleMode === 'dubbing_only' ? (
+            <span className="text-xs text-amber-300/90 whitespace-nowrap shrink-0 px-2 py-1">
+              Subtitle: Nonaktif (Dubbing Only)
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={onToggleShowOriginalSubtitle}
+              className="text-xs text-slate-300 hover:text-white transition-colors whitespace-nowrap shrink-0 px-2 py-1 rounded hover:bg-white/5"
+            >
+              Teks Overlay: {showOriginalSubtitle ? 'Asli' : 'Terjemahan'}
+              {subtitleMode === 'softsub' ? ' · Soft Sub' : ''}
+            </button>
+          ))}
       </div>
 
       {/* Video Stage */}
       <div
         onDragOver={(e) => e.preventDefault()}
         onDrop={handleDrop}
-        className="relative aspect-video bg-[#07090F] flex items-center justify-center overflow-hidden"
+        className={`relative bg-[#07090F] flex items-center justify-center overflow-hidden ${
+          hasMedia ? 'aspect-video' : 'min-h-[270px] sm:aspect-video'
+        }`}
       >
         {!hasMedia ? (
-          <div className="p-6 sm:p-10 text-center max-w-md mx-auto flex flex-col items-center">
+          <div className="p-5 sm:p-10 text-center max-w-md mx-auto flex flex-col items-center">
             <div className="w-12 h-12 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-400 mb-4">
               <Upload className="w-6 h-6" aria-hidden="true" />
             </div>
@@ -260,7 +275,7 @@ export function VideoPreview({
         )}
 
         {/* Real-time Subtitle Overlay with Dynamic Modes */}
-        {hasMedia && activeSubtitleText && (
+        {hasMedia && subtitleMode !== 'dubbing_only' && activeSubtitleText && (
           <div
             data-testid="subtitle-overlay"
             data-dynamic-mode={subtitleStyle.dynamicMode}

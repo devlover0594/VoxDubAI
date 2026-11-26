@@ -1,13 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { Loader2, Mic, Plus, Square } from 'lucide-react';
+import type { AiProviderConfig } from '../types/dubbing';
+import { buildAnalysisCandidateChain } from '../utils/aiRouting';
 
 interface MicTranscriberProps {
   targetLanguage: string;
+  aiConfig?: AiProviderConfig;
   onAddTranscribedSegment: (originalText: string, translatedText: string) => void;
 }
 
 export function MicTranscriber({
   targetLanguage,
+  aiConfig,
   onAddTranscribedSegment,
 }: MicTranscriberProps) {
   const [isRecording, setIsRecording] = useState(false);
@@ -16,6 +20,7 @@ export function MicTranscriber({
   const [transcript, setTranscript] = useState('');
   const [translatedText, setTranslatedText] = useState('');
   const [micError, setMicError] = useState<string | null>(null);
+  const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -34,6 +39,7 @@ export function MicTranscriber({
   const uploadAudioForTranscription = async (audioBlob: Blob) => {
     setIsTranscribing(true);
     setMicError(null);
+    setFallbackNotice(null);
     try {
       const formData = new FormData();
       const ext = audioBlob.type.includes('mp4')
@@ -43,6 +49,15 @@ export function MicTranscriber({
         : 'webm';
       formData.append('audio', audioBlob, `mic_recording.${ext}`);
       formData.append('targetLanguage', targetLanguage);
+      if (aiConfig) {
+        const candidates = buildAnalysisCandidateChain(aiConfig, {
+          hasMediaAttachment: true,
+        });
+        formData.append('aiConfig', JSON.stringify(candidates[0]));
+        if (candidates.length > 1) {
+          formData.append('fallbackConfigs', JSON.stringify(candidates.slice(1)));
+        }
+      }
 
       const res = await fetch('/api/transcribe-mic', {
         method: 'POST',
@@ -55,6 +70,11 @@ export function MicTranscriber({
 
       setTranscript(data.transcript || '');
       setTranslatedText(data.translatedText || data.transcript || '');
+      if (data?.fallbackUsed && data?.usedProvider) {
+        setFallbackNotice(
+          `Diproses via Auto-Fallback (${data.usedProvider}).`
+        );
+      }
     } catch (err) {
       setMicError(
         err instanceof Error
@@ -157,7 +177,7 @@ export function MicTranscriber({
               Dikte &amp; Transkripsi Mikrofon
             </h2>
             <p className="text-xs text-slate-400">
-              Rekam suara Anda untuk membuat segmen baru dengan Gemini Transcribe
+              Rekam suara Anda untuk membuat segmen baru dengan AI Provider aktif
             </p>
           </div>
         </div>
@@ -203,6 +223,12 @@ export function MicTranscriber({
         </p>
       )}
 
+      {fallbackNotice && (
+        <p className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/25 rounded-lg px-3 py-2">
+          {fallbackNotice}
+        </p>
+      )}
+
       {(transcript || translatedText) && (
         <div className="space-y-2.5 pt-2 border-t border-white/6">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -211,7 +237,7 @@ export function MicTranscriber({
                 htmlFor="mic-transcript"
                 className="block text-[11px] text-slate-400 mb-1"
               >
-                Hasil Transkrip (gemini-3.5-transcribe)
+                Hasil Transkrip
               </label>
               <textarea
                 id="mic-transcript"

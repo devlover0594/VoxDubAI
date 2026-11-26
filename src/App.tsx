@@ -21,19 +21,23 @@ import { WaveformVisualizer } from './components/WaveformVisualizer';
 import { SegmentEditor } from './components/SegmentEditor';
 import { MicTranscriber } from './components/MicTranscriber';
 import { CloudProjectsModal } from './components/CloudProjectsModal';
+import { AiProviderModal } from './components/AiProviderModal';
 import {
   createDemoSegments,
   DEMO_VIDEO_DURATION,
   DEMO_VIDEO_TITLE,
 } from './data/demoProject';
-import type {
-  ApiHealthStatus,
-  AudioMode,
-  DubSegment,
-  ProcessingStage,
-  SavedDubbingProject,
-  SubtitleStyle,
-  VoiceStyle,
+import {
+  DEFAULT_AI_PROVIDER_CONFIG,
+  type AiProviderConfig,
+  type ApiHealthStatus,
+  type AudioMode,
+  type DubSegment,
+  type ProcessingStage,
+  type SavedDubbingProject,
+  type SubtitleRenderMode,
+  type SubtitleStyle,
+  type VoiceStyle,
 } from './types/dubbing';
 import {
   applyTextCorrectionToWords,
@@ -50,8 +54,67 @@ import {
   base64WavToObjectUrl,
   mergeSegmentsToMasterWav,
 } from './utils/audioMixer';
+import {
+  NonRetryableTtsError,
+  runWithTtsRetry,
+  SequentialTtsQueue,
+} from './utils/ttsQueue';
+import {
+  renderVideoToMp4,
+  type RenderAudioMixMode,
+} from './utils/mp4ClientRenderer';
+import { getMp4DownloadFilename } from './utils/mp4RenderConfig';
+import {
+  buildAnalysisCandidateChain,
+  buildTtsCandidateChain,
+  getDualRoleSummary,
+} from './utils/aiRouting';
 
 const MAX_UPLOAD_BYTES = 80 * 1024 * 1024; // 80 MB
+
+const SPEECH_LOCALE_MAP: Record<string, string> = {
+  id: 'id-ID',
+  en: 'en-US',
+  ja: 'ja-JP',
+  ko: 'ko-KR',
+  zh: 'zh-CN',
+  ar: 'ar-SA',
+  es: 'es-ES',
+  fr: 'fr-FR',
+  de: 'de-DE',
+};
+
+function estimateSpeechDurationSec(text: string): number {
+  const words = text.trim().split(/\s+/).filter(Boolean).length;
+  return Math.max(1.6, words * 0.42);
+}
+
+function speakTextWithBrowserSpeech(
+  text: string,
+  targetLang: string,
+  segDurationSec: number,
+  voiceStyle: VoiceStyle
+) {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+  const synth = window.speechSynthesis;
+  synth.cancel();
+
+  const trimmed = text.trim();
+  if (!trimmed) return;
+
+  const utterance = new SpeechSynthesisUtterance(trimmed);
+  utterance.lang = SPEECH_LOCALE_MAP[targetLang] ?? 'id-ID';
+  const estDur = estimateSpeechDurationSec(trimmed);
+  utterance.rate = computeDubbingPlaybackRate(estDur, segDurationSec);
+  utterance.pitch =
+    voiceStyle === 'male_pro' ? 0.9 : voiceStyle === 'female_friendly' ? 1.12 : 1.0;
+
+  try {
+    synth.speak(utterance);
+  } catch {
+    // Ignore browser speech playback blocks prior to user gesture
+  }
+}
 
 function triggerFileDownload(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -101,6 +164,15 @@ export default function App() {
   const [statusDetail, setStatusDetail] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isExportingAudio, setIsExportingAudio] = useState<boolean>(false);
+  const [isRenderingMp4, setIsRenderingMp4] = useState<boolean>(false);
+  const [renderProgress, setRenderProgress] = useState<{
+    percent: number;
+    detail: string;
+  } | null>(null);
+  const [mp4AudioMixMode, setMp4AudioMixMode] =
+    useState<RenderAudioMixMode>('dubbed_only');
+  const [subtitleRenderMode, setSubtitleRenderMode] =
+    useState<SubtitleRenderMode>('hardsub');
 
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>({
     fontSize: 'lg',
@@ -110,6 +182,24 @@ export default function App() {
     dynamicMode: 'karaoke',
   });
 
+  const [aiConfig, setAiConfig] = useState<AiProviderConfig>(
+    DEFAULT_AI_PROVIDER_CONFIG
+  );
+  const [autoContinueTts, setAutoContinueTts] = useState<boolean>(false);
+  const [isAiModalOpen, setIsAiModalOpen] = useState<boolean>(false);
+
+  const dualRoleSummary = useMemo(() => getDualRoleSummary(aiConfig), [aiConfig]);
+
+  const activeAiHeaderLabel = useMemo(() => {
+    if (dualRoleSummary.isSplitTts) {
+      return `${dualRoleSummary.resolvedAnalysisVideo} + TTS`;
+    }
+    if (dualRoleSummary.isAutoAnalysis && dualRoleSummary.isAutoTts) {
+      return `Auto · ${dualRoleSummary.resolvedAnalysisVideo}`;
+    }
+    return dualRoleSummary.analysisModelLabel;
+  }, [dualRoleSummary]);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const dubAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -117,6 +207,7 @@ export default function App() {
   const lastTriggeredSegmentIdRef = useRef<number | null>(null);
   const demoRafRef = useRef<number | null>(null);
   const demoLastTickRef = useRef<number | null>(null);
+  const ttsQueueRef = useRef<SequentialTtsQueue>(new SequentialTtsQueue(1100));
 
   const isBusy =
     stage === 'uploading' || stage === 'analyzing' || stage === 'dubbing';
@@ -196,6 +287,9 @@ export default function App() {
     }
     if (singlePreviewAudioRef.current) {
       singlePreviewAudioRef.current.pause();
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
     }
     lastTriggeredSegmentIdRef.current = null;
   }, []);
@@ -294,13 +388,19 @@ export default function App() {
       if (dubAudioRef.current) {
         dubAudioRef.current.pause();
       }
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
       lastTriggeredSegmentIdRef.current = null;
       return;
     }
 
-    if (!activeSegment || !activeSegment.audioUrl) {
+    if (!activeSegment || (!activeSegment.audioUrl && !activeSegment.useBrowserSpeech)) {
       if (dubAudioRef.current && !dubAudioRef.current.paused) {
         dubAudioRef.current.pause();
+      }
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
       }
       lastTriggeredSegmentIdRef.current = null;
       return;
@@ -311,6 +411,21 @@ export default function App() {
     }
 
     lastTriggeredSegmentIdRef.current = activeSegment.id;
+
+    if (activeSegment.useBrowserSpeech && !activeSegment.audioUrl) {
+      if (dubAudioRef.current) {
+        dubAudioRef.current.pause();
+      }
+      speakTextWithBrowserSpeech(
+        activeSegment.translatedText,
+        targetLanguage,
+        getSegmentDurationSeconds(activeSegment),
+        voiceStyle
+      );
+      return;
+    }
+
+    if (!activeSegment.audioUrl) return;
 
     if (!dubAudioRef.current) {
       dubAudioRef.current = new Audio();
@@ -343,7 +458,7 @@ export default function App() {
     } else {
       clip.addEventListener('loadedmetadata', startClip, { once: true });
     }
-  }, [activeSegment, audioMode, currentTime, isPlaying]);
+  }, [activeSegment, audioMode, currentTime, isPlaying, targetLanguage, voiceStyle]);
 
   const handleSignIn = useCallback(async () => {
     setErrorMessage(null);
@@ -431,7 +546,7 @@ export default function App() {
       setSegments(proj.segments);
       setStage('completed');
       setProgressPercent(100);
-      setStatusDetail(`Proyek "${proj.title}" dimuat dari Cloud. Klik Generate Semua Audio TTS untuk membuat klip suara.`);
+      setStatusDetail(`Proyek "${proj.title}" dimuat dari Cloud. Klik Generate Dubbing AI (TTS) untuk membuat klip suara.`);
       showToast(`Proyek "${proj.title}" berhasil dimuat.`);
     },
     [showToast, stopAllDubbingAudio, videoUrl]
@@ -459,33 +574,128 @@ export default function App() {
       segId: number,
       text: string,
       chosenVoice: VoiceStyle,
-      chosenTargetLang: string
-    ): Promise<{ ok: boolean; error?: string }> => {
+      chosenTargetLang: string,
+      onRetryProgress?: (attempt: number, maxAttempts: number, delayMs: number) => void
+    ): Promise<{
+      ok: boolean;
+      error?: string;
+      fallbackUsed?: boolean;
+      usedProvider?: string;
+      usedModel?: string;
+    }> => {
       setSegments((prev) =>
         prev.map((s) =>
           s.id === segId
-            ? { ...s, isGeneratingAudio: true, audioError: undefined }
+            ? {
+                ...s,
+                audioQueueStatus: 'processing',
+                audioRetryAttempt: 1,
+                audioMaxRetries: 5,
+                isGeneratingAudio: true,
+                audioError: undefined,
+              }
             : s
         )
       );
 
       try {
-        const res = await fetch('/api/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text,
-            voiceStyle: chosenVoice,
-            targetLanguage: chosenTargetLang,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data?.error || 'Gagal membuat audio dubbing.');
+        const ttsChain = buildTtsCandidateChain(aiConfig);
+        const primaryTtsConfig = ttsChain[0];
+        const fallbackTtsConfigs = ttsChain.slice(1);
+        const result = await runWithTtsRetry(
+          async () => {
+            const res = await fetch('/api/tts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                text,
+                voiceStyle: chosenVoice,
+                targetLanguage: chosenTargetLang,
+                aiConfig: primaryTtsConfig,
+                fallbackConfigs: fallbackTtsConfigs,
+              }),
+            });
+            const data = await res.json();
+
+            if (data?.unsupportedTts) {
+              return { unsupportedTts: true as const, data };
+            }
+
+            if (!res.ok) {
+              const msg = data?.error || 'Gagal membuat audio dubbing.';
+              if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 413) {
+                throw new NonRetryableTtsError(msg, res.status);
+              }
+              const retryableErr = new Error(msg) as Error & { httpStatus?: number };
+              retryableErr.httpStatus = res.status;
+              throw retryableErr;
+            }
+
+            if (!data?.audioBase64) {
+              throw new Error('Data audio TTS kosong dari server.');
+            }
+
+            return { unsupportedTts: false as const, data };
+          },
+          {
+            maxAttempts: 5,
+            baseDelayMs: 2200,
+            maxDelayMs: 15000,
+            onRetry: ({ attempt, maxAttempts, delayMs }) => {
+              setSegments((prev) =>
+                prev.map((s) =>
+                  s.id === segId
+                    ? {
+                        ...s,
+                        audioQueueStatus: 'retrying',
+                        audioRetryAttempt: attempt + 1,
+                        audioMaxRetries: maxAttempts,
+                        isGeneratingAudio: true,
+                        audioError: undefined,
+                      }
+                    : s
+                )
+              );
+              onRetryProgress?.(attempt + 1, maxAttempts, delayMs);
+            },
+          }
+        );
+
+        if (result.unsupportedTts) {
+          const data = result.data;
+          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            const estDur = estimateSpeechDurationSec(text);
+            setSegments((prev) =>
+              prev.map((s) => {
+                if (s.id !== segId) return s;
+                if (s.audioUrl) URL.revokeObjectURL(s.audioUrl);
+                return {
+                  ...s,
+                  audioUrl: undefined,
+                  useBrowserSpeech: true,
+                  audioDuration: estDur,
+                  audioQueueStatus: 'done',
+                  audioRetryAttempt: undefined,
+                  audioMaxRetries: undefined,
+                  isGeneratingAudio: false,
+                  audioError: undefined,
+                };
+              })
+            );
+            showToast(
+              data?.message ||
+                `Provider ${data?.providerLabel || 'pilihan'} tidak memiliki endpoint TTS; pemutaran dialihkan ke Web Speech browser.`
+            );
+            return { ok: true };
+          }
+          throw new NonRetryableTtsError(
+            data?.message || 'Provider AI aktif tidak menyediakan endpoint TTS audio.'
+          );
         }
 
         const { url, duration: wavDuration } = await base64WavToObjectUrl(
-          data.audioBase64
+          result.data.audioBase64,
+          result.data.mimeType
         );
 
         setSegments((prev) =>
@@ -495,14 +705,38 @@ export default function App() {
             return {
               ...s,
               audioUrl: url,
+              useBrowserSpeech: false,
               audioDuration: wavDuration,
+              ttsUsedProvider:
+                typeof result.data.usedProvider === 'string'
+                  ? result.data.usedProvider
+                  : undefined,
+              ttsUsedModel:
+                typeof result.data.usedModel === 'string'
+                  ? result.data.usedModel
+                  : undefined,
+              ttsUsedFallback: Boolean(result.data.fallbackUsed),
+              audioQueueStatus: 'done',
+              audioRetryAttempt: undefined,
+              audioMaxRetries: undefined,
               isGeneratingAudio: false,
               audioError: undefined,
             };
           })
         );
 
-        return { ok: true };
+        return {
+          ok: true,
+          fallbackUsed: Boolean(result.data.fallbackUsed),
+          usedProvider:
+            typeof result.data.usedProvider === 'string'
+              ? result.data.usedProvider
+              : undefined,
+          usedModel:
+            typeof result.data.usedModel === 'string'
+              ? result.data.usedModel
+              : undefined,
+        };
       } catch (err) {
         const message =
           err instanceof Error
@@ -511,17 +745,153 @@ export default function App() {
         setSegments((prev) =>
           prev.map((s) =>
             s.id === segId
-              ? { ...s, isGeneratingAudio: false, audioError: message }
+              ? {
+                  ...s,
+                  audioQueueStatus: 'error',
+                  audioRetryAttempt: undefined,
+                  audioMaxRetries: undefined,
+                  isGeneratingAudio: false,
+                  audioError: message,
+                }
               : s
           )
         );
         return { ok: false, error: message };
       }
     },
-    []
+    [aiConfig, showToast]
   );
 
-  const runFullPipeline = useCallback(
+  const enqueueSegmentTts = useCallback(
+    (
+      segId: number,
+      text: string,
+      chosenVoice: VoiceStyle,
+      chosenTargetLang: string,
+      onRetryProgress?: (attempt: number, maxAttempts: number, delayMs: number) => void
+    ): Promise<{
+      ok: boolean;
+      error?: string;
+      fallbackUsed?: boolean;
+      usedProvider?: string;
+      usedModel?: string;
+    }> => {
+      setSegments((prev) =>
+        prev.map((s) =>
+          s.id === segId
+            ? {
+                ...s,
+                audioQueueStatus: 'queued',
+                isGeneratingAudio: true,
+                audioError: undefined,
+              }
+            : s
+        )
+      );
+
+      return new Promise((resolve) => {
+        const enqueued = ttsQueueRef.current.enqueue(`seg-${segId}`, async () => {
+          const outcome = await generateSegmentTts(
+            segId,
+            text,
+            chosenVoice,
+            chosenTargetLang,
+            onRetryProgress
+          );
+          resolve(outcome);
+        });
+        if (!enqueued) {
+          resolve({ ok: true });
+        }
+      });
+    },
+    [generateSegmentTts]
+  );
+
+  const handleGenerateAllDubbing = useCallback(
+    async (overrideSegments?: DubSegment[]) => {
+      const targetList = overrideSegments ?? segments;
+      if (targetList.length === 0) return;
+
+      setErrorMessage(null);
+      setStage('dubbing');
+      setProgressPercent(60);
+      setStatusDetail(
+        `Menyiapkan antrian TTS (${dualRoleSummary.ttsProviderLabel} · ${dualRoleSummary.ttsModelLabel}) untuk ${targetList.length} segmen...`
+      );
+
+      setSegments((prev) =>
+        prev.map((s) =>
+          s.translatedText.trim()
+            ? {
+                ...s,
+                audioQueueStatus: 'queued',
+                isGeneratingAudio: true,
+                audioError: undefined,
+              }
+            : s
+        )
+      );
+
+      let failedCount = 0;
+      let fallbackSuccessCount = 0;
+      let lastFallbackProvider = '';
+      let firstErr: string | undefined;
+
+      for (let i = 0; i < targetList.length; i++) {
+        const seg = targetList[i];
+        setProgressPercent(60 + Math.round(((i + 1) / targetList.length) * 39));
+        setStatusDetail(
+          `Antrian TTS (${dualRoleSummary.ttsModelLabel}): memproses segmen ${i + 1} dari ${targetList.length}...`
+        );
+        if (!seg.translatedText.trim()) continue;
+        const res = await enqueueSegmentTts(
+          seg.id,
+          seg.translatedText,
+          voiceStyle,
+          targetLanguage,
+          (attempt, maxAttempts, delayMs) => {
+            setStatusDetail(
+              `Antrian TTS segmen ${i + 1}/${targetList.length}: mencoba ulang otomatis (${attempt}/${maxAttempts}) dalam ${(delayMs / 1000).toFixed(1)}d...`
+            );
+          }
+        );
+        if (!res.ok) {
+          failedCount++;
+          if (!firstErr) firstErr = res.error;
+        } else if (res.fallbackUsed) {
+          fallbackSuccessCount++;
+          if (res.usedProvider) lastFallbackProvider = res.usedProvider;
+        }
+      }
+
+      setStage('completed');
+      setProgressPercent(100);
+      setAudioMode('dubbed');
+      if (failedCount > 0) {
+        setStatusDetail(`${failedCount} segmen gagal setelah beberapa kali percobaan.`);
+        if (firstErr) setErrorMessage(firstErr);
+      } else if (fallbackSuccessCount > 0) {
+        setStatusDetail(
+          `Selesai! ${targetList.length} klip audio dubbing berhasil dibuat (${fallbackSuccessCount} via Auto-Fallback${lastFallbackProvider ? ` ke ${lastFallbackProvider}` : ''}).`
+        );
+      } else {
+        setStatusDetail(
+          `Selesai! ${targetList.length} klip audio dubbing berhasil dibuat dengan ${dualRoleSummary.ttsModelLabel}.`
+        );
+      }
+    },
+    [
+      dualRoleSummary.ttsModelLabel,
+      dualRoleSummary.ttsProviderLabel,
+      enqueueSegmentTts,
+      segments,
+      targetLanguage,
+      voiceStyle,
+    ]
+  );
+
+  const runAnalyzeVideo = useCallback(
     async (file: File) => {
       setErrorMessage(null);
       setStage('uploading');
@@ -529,15 +899,24 @@ export default function App() {
       setStatusDetail(`Mengunggah ${file.name} ke server...`);
 
       try {
+        const analysisChain = buildAnalysisCandidateChain(aiConfig, {
+          hasMediaAttachment: true,
+        });
+        const analysisReqConfig = analysisChain[0];
+
         const formData = new FormData();
         formData.append('media', file);
         formData.append('sourceLanguage', sourceLanguage);
         formData.append('targetLanguage', targetLanguage);
+        formData.append('aiConfig', JSON.stringify(analysisReqConfig));
+        if (analysisChain.length > 1) {
+          formData.append('fallbackConfigs', JSON.stringify(analysisChain.slice(1)));
+        }
 
         setStage('analyzing');
-        setProgressPercent(40);
+        setProgressPercent(38);
         setStatusDetail(
-          'Menganalisis audio, word-level timestamps & menerjemahkan dengan Gemini AI...'
+          `Menganalisis audio, word-level timestamps & menerjemahkan dengan ${dualRoleSummary.analysisProviderLabel} (${analysisReqConfig.model})...`
         );
 
         const analyzeRes = await fetch('/api/analyze', {
@@ -562,65 +941,53 @@ export default function App() {
           );
         }
 
+        const usedModel =
+          typeof analyzeData?.usedModel === 'string' && analyzeData.usedModel
+            ? analyzeData.usedModel
+            : analysisReqConfig.model;
+        const usedProvider =
+          typeof analyzeData?.usedProvider === 'string' && analyzeData.usedProvider
+            ? analyzeData.usedProvider
+            : dualRoleSummary.analysisProviderLabel;
+        const fallbackNote = analyzeData?.fallbackUsed
+          ? ` (Auto-Fallback ke ${usedProvider})`
+          : '';
+
         setSegments(extracted);
-        setStage('dubbing');
-        setProgressPercent(60);
+
+        if (autoContinueTts) {
+          await handleGenerateAllDubbing(extracted);
+          return;
+        }
+
+        setStage('analyzed');
+        setProgressPercent(55);
         setStatusDetail(
-          `Menyiapkan sulih suara AI untuk ${extracted.length} segmen...`
+          `Analisis selesai dengan ${usedModel}${fallbackNote} (${extracted.length} segmen). Silakan tinjau/edit teks, lalu klik "Generate Dubbing AI (TTS)".`
         );
-
-        let failedCount = 0;
-        let firstTtsError: string | undefined;
-
-        for (let i = 0; i < extracted.length; i++) {
-          const seg = extracted[i];
-          const pct = 60 + Math.round(((i + 1) / extracted.length) * 38);
-          setProgressPercent(pct);
-          setStatusDetail(
-            `Menyiapkan dubbing segmen ${i + 1} dari ${extracted.length}...`
-          );
-
-          if (!seg.translatedText.trim()) continue;
-          const result = await generateSegmentTts(
-            seg.id,
-            seg.translatedText,
-            voiceStyle,
-            targetLanguage
-          );
-          if (!result.ok) {
-            failedCount++;
-            if (!firstTtsError) firstTtsError = result.error;
-          }
-        }
-
-        setStage('completed');
-        setProgressPercent(100);
-        setAudioMode('dubbed');
-
-        if (failedCount > 0) {
-          setStatusDetail(
-            `Transkrip selesai, namun ${failedCount} segmen gagal dibuatkan audio.`
-          );
-          if (firstTtsError) {
-            setErrorMessage(firstTtsError);
-          }
-        } else {
-          setStatusDetail(
-            `Selesai! ${extracted.length} segmen subtitle, word timestamps, dan audio dubbing siap.`
-          );
-        }
+        showToast(
+          `Transkrip & subtitle siap (${extracted.length} segmen via ${usedModel}${fallbackNote}). Klik Generate Dubbing AI untuk membuat suara.`
+        );
       } catch (err) {
         const msg =
           err instanceof Error
             ? err.message
-            : 'Terjadi kesalahan saat memproses video.';
+            : 'Terjadi kesalahan saat menganalisis video.';
         setStage('error');
         setProgressPercent(0);
-        setStatusDetail('Pemrosesan terhenti.');
+        setStatusDetail('Analisis terhenti.');
         setErrorMessage(msg);
       }
     },
-    [generateSegmentTts, sourceLanguage, targetLanguage, voiceStyle]
+    [
+      aiConfig,
+      autoContinueTts,
+      dualRoleSummary.analysisProviderLabel,
+      handleGenerateAllDubbing,
+      showToast,
+      sourceLanguage,
+      targetLanguage,
+    ]
   );
 
   const handleFileSelected = useCallback(
@@ -663,10 +1030,14 @@ export default function App() {
       setCurrentTime(0);
       setDuration(0);
       setSegments([]);
-
-      void runFullPipeline(file);
+      setStage('idle');
+      setProgressPercent(0);
+      setStatusDetail(
+        `Video "${file.name}" dimuat. Pilih bahasa lalu klik "Analisis & Transkrip Video".`
+      );
+      showToast('Video dimuat. Klik "Analisis & Transkrip Video" di panel kanan untuk memulai.');
     },
-    [runFullPipeline, stopAllDubbingAudio, videoUrl]
+    [showToast, stopAllDubbingAudio, videoUrl]
   );
 
   const handleTogglePlay = useCallback(() => {
@@ -698,6 +1069,9 @@ export default function App() {
       lastTriggeredSegmentIdRef.current = null;
       if (dubAudioRef.current) {
         dubAudioRef.current.pause();
+      }
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
       }
 
       setCurrentTime(clamped);
@@ -758,6 +1132,9 @@ export default function App() {
       );
 
       try {
+        const textChain = buildAnalysisCandidateChain(aiConfig, {
+          hasMediaAttachment: false,
+        });
         const res = await fetch('/api/fix-grammar', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -765,6 +1142,8 @@ export default function App() {
             text: target.translatedText,
             originalText: target.originalText,
             targetLanguage,
+            aiConfig: textChain[0],
+            fallbackConfigs: textChain.slice(1),
           }),
         });
         const data = await res.json();
@@ -798,10 +1177,15 @@ export default function App() {
           })
         );
 
+        const fbNote =
+          data?.fallbackUsed && data?.usedProvider
+            ? ` (via Auto-Fallback ${data.usedProvider})`
+            : '';
+
         showToast(
           changed
-            ? 'Ejaan & tata bahasa segmen diperbaiki (timestamp tetap terjaga).'
-            : 'Ejaan & tata bahasa segmen sudah tepat.'
+            ? `Ejaan & tata bahasa segmen diperbaiki${fbNote} (timestamp tetap terjaga).`
+            : `Ejaan & tata bahasa segmen sudah tepat${fbNote}.`
         );
       } catch (err) {
         const msg =
@@ -817,73 +1201,58 @@ export default function App() {
         );
       }
     },
-    [segments, showToast, targetLanguage]
+    [aiConfig, segments, showToast, targetLanguage]
   );
 
   const handleRegenerateSegmentAudio = useCallback(
     (id: number) => {
       const target = segments.find((s) => s.id === id);
       if (!target || !target.translatedText.trim()) return;
-      void generateSegmentTts(
+      void enqueueSegmentTts(
         id,
         target.translatedText,
         voiceStyle,
-        targetLanguage
+        targetLanguage,
+        (attempt, maxAttempts, delayMs) => {
+          setStatusDetail(
+            `Antrian TTS segmen #${id}: mencoba ulang (${attempt}/${maxAttempts}) dalam ${(delayMs / 1000).toFixed(1)}d...`
+          );
+        }
       );
     },
-    [generateSegmentTts, segments, targetLanguage, voiceStyle]
+    [enqueueSegmentTts, segments, targetLanguage, voiceStyle]
   );
 
-  const handleGenerateAllDubbing = useCallback(async () => {
-    if (segments.length === 0) return;
-    setErrorMessage(null);
-    setStage('dubbing');
-    setProgressPercent(20);
-    setStatusDetail(`Membuat ulang audio dubbing untuk ${segments.length} segmen...`);
+  // Duplicate handleGenerateAllDubbing block removed (moved above runAnalyzeVideo)
 
-    let failedCount = 0;
-    let firstErr: string | undefined;
-
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i];
-      setProgressPercent(20 + Math.round(((i + 1) / segments.length) * 80));
-      setStatusDetail(`Memproses suara segmen ${i + 1} dari ${segments.length}...`);
-      if (!seg.translatedText.trim()) continue;
-      const res = await generateSegmentTts(
-        seg.id,
-        seg.translatedText,
-        voiceStyle,
-        targetLanguage
-      );
-      if (!res.ok) {
-        failedCount++;
-        if (!firstErr) firstErr = res.error;
+  const handlePlaySingleSegment = useCallback(
+    (seg: DubSegment) => {
+      if (seg.useBrowserSpeech && !seg.audioUrl) {
+        if (singlePreviewAudioRef.current) {
+          singlePreviewAudioRef.current.pause();
+        }
+        speakTextWithBrowserSpeech(
+          seg.translatedText,
+          targetLanguage,
+          getSegmentDurationSeconds(seg),
+          voiceStyle
+        );
+        return;
       }
-    }
-
-    setStage('completed');
-    setProgressPercent(100);
-    if (failedCount > 0) {
-      setStatusDetail(`${failedCount} segmen gagal dibuatkan audio.`);
-      if (firstErr) setErrorMessage(firstErr);
-    } else {
-      setStatusDetail('Semua klip audio dubbing berhasil diperbarui.');
-    }
-  }, [generateSegmentTts, segments, targetLanguage, voiceStyle]);
-
-  const handlePlaySingleSegment = useCallback((seg: DubSegment) => {
-    if (!seg.audioUrl) return;
-    if (!singlePreviewAudioRef.current) {
-      singlePreviewAudioRef.current = new Audio();
-    }
-    const audio = singlePreviewAudioRef.current;
-    audio.pause();
-    audio.src = seg.audioUrl;
-    audio.currentTime = 0;
-    const segDur = getSegmentDurationSeconds(seg);
-    audio.playbackRate = computeDubbingPlaybackRate(seg.audioDuration || 0, segDur);
-    audio.play().catch(() => {});
-  }, []);
+      if (!seg.audioUrl) return;
+      if (!singlePreviewAudioRef.current) {
+        singlePreviewAudioRef.current = new Audio();
+      }
+      const audio = singlePreviewAudioRef.current;
+      audio.pause();
+      audio.src = seg.audioUrl;
+      audio.currentTime = 0;
+      const segDur = getSegmentDurationSeconds(seg);
+      audio.playbackRate = computeDubbingPlaybackRate(seg.audioDuration || 0, segDur);
+      audio.play().catch(() => {});
+    },
+    [targetLanguage, voiceStyle]
+  );
 
   const handleAddSegment = useCallback(() => {
     setSegments((prev) => {
@@ -938,13 +1307,13 @@ export default function App() {
         setDuration(endSec + 1);
       }
 
-      void generateSegmentTts(nextId, transText, voiceStyle, targetLanguage);
-      showToast('Segmen hasil transkripsi mikrofon ditambahkan ke daftar.');
+      void enqueueSegmentTts(nextId, transText, voiceStyle, targetLanguage);
+      showToast('Segmen hasil transkripsi mikrofon ditambahkan ke antrian TTS.');
     },
     [
       currentTime,
       duration,
-      generateSegmentTts,
+      enqueueSegmentTts,
       isDemoMode,
       segments,
       showToast,
@@ -1000,6 +1369,69 @@ export default function App() {
     }
   }, [duration, segments, videoName]);
 
+  const handleRenderAndDownloadMp4 = useCallback(async () => {
+    if (segments.length === 0 || isRenderingMp4) return;
+    setIsRenderingMp4(true);
+    setErrorMessage(null);
+    setRenderProgress({ percent: 5, detail: 'Memulai proses render MP4...' });
+
+    try {
+      const renderResult = await renderVideoToMp4({
+        selectedFile,
+        videoUrl,
+        videoName,
+        segments,
+        subtitleStyle,
+        subtitleMode: subtitleRenderMode,
+        targetLanguage,
+        durationSeconds: duration,
+        showOriginalSubtitle,
+        audioMixMode: mp4AudioMixMode,
+        onProgress: (percent, detail) => {
+          setRenderProgress({ percent, detail });
+        },
+      });
+      const outFilename = getMp4DownloadFilename(videoName, subtitleRenderMode);
+      triggerFileDownload(renderResult.blob, outFilename);
+      if (renderResult.companionSrt) {
+        const baseName = (videoName || 'voxdub').replace(/\.[^.]+$/, '') || 'voxdub';
+        triggerFileDownload(
+          new Blob([renderResult.companionSrt], { type: 'text/plain;charset=utf-8' }),
+          `${baseName}_softsub.srt`
+        );
+      }
+      const modeToast =
+        subtitleRenderMode === 'softsub'
+          ? 'Video MP4 (Soft Sub trek terpisah + Voice-Over) berhasil dirender dan diunduh.'
+          : subtitleRenderMode === 'dubbing_only'
+          ? 'Video MP4 (Dubbing Only tanpa subtitle) berhasil dirender dan diunduh.'
+          : 'Video MP4 (Hard Sub + Voice-Over) berhasil dirender dan diunduh.';
+      showToast(modeToast);
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Gagal merender video MP4.';
+      setErrorMessage(msg);
+    } finally {
+      setIsRenderingMp4(false);
+      setRenderProgress(null);
+    }
+  }, [
+    duration,
+    isRenderingMp4,
+    mp4AudioMixMode,
+    segments,
+    selectedFile,
+    showOriginalSubtitle,
+    showToast,
+    subtitleRenderMode,
+    subtitleStyle,
+    targetLanguage,
+    videoName,
+    videoUrl,
+  ]);
+
   return (
     <div className="min-h-screen bg-[#0B0D14] text-slate-100 flex flex-col">
       <Header
@@ -1013,6 +1445,9 @@ export default function App() {
         onSignOut={() => void handleSignOut()}
         onOpenProjects={() => setIsProjectsModalOpen(true)}
         onSaveProject={() => void handleSaveProjectToCloud()}
+        onOpenAiSettings={() => setIsAiModalOpen(true)}
+        activeAiLabel={activeAiHeaderLabel}
+        activeProvider={aiConfig.provider}
         isBusy={isBusy}
         onTriggerUpload={() => fileInputRef.current?.click()}
       />
@@ -1093,6 +1528,7 @@ export default function App() {
               audioMode={audioMode}
               activeSegment={activeSegment}
               subtitleStyle={subtitleStyle}
+              subtitleMode={subtitleRenderMode}
               showOriginalSubtitle={showOriginalSubtitle}
               onToggleShowOriginalSubtitle={() =>
                 setShowOriginalSubtitle((prev) => !prev)
@@ -1100,8 +1536,11 @@ export default function App() {
               onTogglePlay={handleTogglePlay}
               onSeek={handleSeek}
               onAudioModeChange={(mode) => {
-                if (mode === 'original' && dubAudioRef.current) {
-                  dubAudioRef.current.pause();
+                if (mode === 'original') {
+                  if (dubAudioRef.current) dubAudioRef.current.pause();
+                  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                    window.speechSynthesis.cancel();
+                  }
                 }
                 lastTriggeredSegmentIdRef.current = null;
                 setAudioMode(mode);
@@ -1138,7 +1577,9 @@ export default function App() {
 
             <SubtitleCustomizer
               style={subtitleStyle}
+              subtitleMode={subtitleRenderMode}
               onChange={setSubtitleStyle}
+              onSubtitleModeChange={setSubtitleRenderMode}
               onDownloadSrt={handleDownloadSrt}
               onDownloadVtt={handleDownloadVtt}
               hasSegments={segments.length > 0}
@@ -1146,6 +1587,7 @@ export default function App() {
 
             <MicTranscriber
               targetLanguage={targetLanguage}
+              aiConfig={aiConfig}
               onAddTranscribedSegment={handleAddTranscribedSegment}
             />
           </div>
@@ -1162,14 +1604,21 @@ export default function App() {
               hasUploadedFile={Boolean(selectedFile)}
               isBusy={isBusy}
               isExportingAudio={isExportingAudio}
+              isRenderingMp4={isRenderingMp4}
+              renderProgress={renderProgress}
+              mp4AudioMixMode={mp4AudioMixMode}
+              onMp4AudioMixModeChange={setMp4AudioMixMode}
+              subtitleMode={subtitleRenderMode}
+              onSubtitleModeChange={setSubtitleRenderMode}
               onSourceLanguageChange={setSourceLanguage}
               onTargetLanguageChange={setTargetLanguage}
               onVoiceStyleChange={setVoiceStyle}
               onProcessVideo={() => {
-                if (selectedFile) void runFullPipeline(selectedFile);
+                if (selectedFile) void runAnalyzeVideo(selectedFile);
               }}
               onGenerateAllDubbing={() => void handleGenerateAllDubbing()}
               onExportBundle={() => void handleExportBundle()}
+              onDownloadMp4={() => void handleRenderAndDownloadMp4()}
               onSegmentChange={handleSegmentChange}
               onSeekToSegment={handleSeekToSegment}
               onAutoFixGrammar={(id) => void handleAutoFixGrammar(id)}
@@ -1177,10 +1626,42 @@ export default function App() {
               onPlaySingleSegment={handlePlaySingleSegment}
               onAddSegment={handleAddSegment}
               onDeleteSegment={handleDeleteSegment}
+              analysisProviderLabel={dualRoleSummary.analysisProviderLabel}
+              analysisModelLabel={dualRoleSummary.analysisModelLabel}
+              analysisFallbackCount={dualRoleSummary.analysisFallbackCount}
+              ttsProviderLabel={dualRoleSummary.ttsProviderLabel}
+              ttsModelLabel={dualRoleSummary.ttsModelLabel}
+              ttsFallbackCount={dualRoleSummary.ttsFallbackCount}
+              autoContinueTts={autoContinueTts}
+              onAutoContinueTtsChange={setAutoContinueTts}
+              isAnalyzing={stage === 'uploading' || stage === 'analyzing'}
+              isDubbing={stage === 'dubbing'}
+              onOpenAiSettings={() => setIsAiModalOpen(true)}
             />
           </div>
         </div>
       </main>
+
+      <AiProviderModal
+        isOpen={isAiModalOpen}
+        config={aiConfig}
+        onClose={() => setIsAiModalOpen(false)}
+        onSave={(next) => {
+          setAiConfig(next);
+          const summary = getDualRoleSummary(next);
+          const fbParts: string[] = [];
+          if (summary.analysisFallbackCount > 0) {
+            fbParts.push(`+${summary.analysisFallbackCount} cadangan analisis`);
+          }
+          if (summary.ttsFallbackCount > 0) {
+            fbParts.push(`+${summary.ttsFallbackCount} cadangan TTS`);
+          }
+          const fbSuffix = fbParts.length > 0 ? ` (${fbParts.join(', ')})` : '';
+          showToast(
+            `Routing AI diperbarui — Analisis: ${summary.analysisModelLabel} | TTS: ${summary.ttsModelLabel}${fbSuffix}.`
+          );
+        }}
+      />
 
       <CloudProjectsModal
         isOpen={isProjectsModalOpen}

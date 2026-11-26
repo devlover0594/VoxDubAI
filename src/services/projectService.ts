@@ -137,8 +137,11 @@ export async function saveDubbingProject(input: SaveProjectInput): Promise<strin
   };
 
   try {
-    const existingSnap = await getDoc(projectRef);
-    if (!existingSnap.exists()) {
+    const isExistingProject = Boolean(
+      input.projectId && /^[a-zA-Z0-9_\-]+$/.test(input.projectId)
+    );
+
+    if (!isExistingProject) {
       await setDoc(projectRef, {
         id,
         ownerId: input.ownerId,
@@ -153,16 +156,37 @@ export async function saveDubbingProject(input: SaveProjectInput): Promise<strin
         updatedAt: serverTimestamp(),
       });
     } else {
-      await updateDoc(projectRef, {
-        title: safeTitle,
-        sourceLanguage: input.sourceLanguage.slice(0, 16),
-        targetLanguage: input.targetLanguage.slice(0, 16),
-        voiceStyle: input.voiceStyle,
-        durationSeconds: Math.max(0, Math.min(86400, Number(input.durationSeconds) || 0)),
-        subtitleStyle: safeSubtitleStyle,
-        segments: safeSegments,
-        updatedAt: serverTimestamp(),
-      });
+      try {
+        await updateDoc(projectRef, {
+          title: safeTitle,
+          sourceLanguage: input.sourceLanguage.slice(0, 16),
+          targetLanguage: input.targetLanguage.slice(0, 16),
+          voiceStyle: input.voiceStyle,
+          durationSeconds: Math.max(0, Math.min(86400, Number(input.durationSeconds) || 0)),
+          subtitleStyle: safeSubtitleStyle,
+          segments: safeSegments,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (updateErr) {
+        const errCode = (updateErr as { code?: string })?.code;
+        if (errCode === 'not-found') {
+          await setDoc(projectRef, {
+            id,
+            ownerId: input.ownerId,
+            title: safeTitle,
+            sourceLanguage: input.sourceLanguage.slice(0, 16),
+            targetLanguage: input.targetLanguage.slice(0, 16),
+            voiceStyle: input.voiceStyle,
+            durationSeconds: Math.max(0, Math.min(86400, Number(input.durationSeconds) || 0)),
+            subtitleStyle: safeSubtitleStyle,
+            segments: safeSegments,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          throw updateErr;
+        }
+      }
     }
     return id;
   } catch (error) {
