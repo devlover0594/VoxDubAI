@@ -1,16 +1,14 @@
 import 'dotenv/config';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { promisify } from 'util';
 import multer from 'multer';
-import { GoogleGenAI, Type } from '@google/genai';
 import {
-  analyzeMediaWithOpenAiCompatible,
   buildCandidateList,
-  createGeminiClientForConfig,
   fetchProviderModels,
   fixGrammarWithProvider,
   getProviderDisplayName,
@@ -24,7 +22,6 @@ import {
   TtsUnsupportedByProviderError,
   type AiProviderRequestConfig,
 } from './server/aiProviders.ts';
-import { resolveAnalysisModelSelection } from './src/utils/aiRouting.ts';
 import {
   buildFfmpegRenderArgs,
   getMp4DownloadFilename,
@@ -35,7 +32,9 @@ import {
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_FILE_SIZE_BYTES = 80 * 1024 * 1024; // 80 MB limit
-const INLINE_THRESHOLD_BYTES = 15 * 1024 * 1024; // 15 MB threshold for inlineData vs File API
+const ANALYSIS_SCRIPT_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'server', 'analyze_media.py');
+const PYTHON_EXECUTABLE =
+  process.env.PYTHON_EXECUTABLE || (process.platform === 'win32' ? 'python' : 'python3');
 
 const ALLOWED_MIME_TYPES = new Set([
   'video/mp4',
@@ -99,40 +98,6 @@ function normalizeMimeType(mimeType: string, originalName: string): string {
   return 'video/mp4';
 }
 
-function formatSecondsToTimestampServer(totalSeconds: number): string {
-  const safe = Math.max(0, Number.isFinite(totalSeconds) ? totalSeconds : 0);
-  const hours = Math.floor(safe / 3600);
-  const minutes = Math.floor((safe % 3600) / 60);
-  const seconds = Math.floor(safe % 60);
-  const millis = Math.round((safe - Math.floor(safe)) * 1000);
-  if (millis === 1000) {
-    return formatSecondsToTimestampServer(Math.floor(safe) + 1);
-  }
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(millis).padStart(3, '0')}`;
-}
-
-function parseSecondsServer(val: unknown): number {
-  if (typeof val === 'number' && Number.isFinite(val) && val >= 0) return val;
-  if (typeof val === 'string') {
-    const clean = val.trim().replace(',', '.');
-    const parts = clean.split(':');
-    if (parts.length === 3) {
-      const h = Number(parts[0]);
-      const m = Number(parts[1]);
-      const s = Number(parts[2]);
-      if (![h, m, s].some(Number.isNaN)) return h * 3600 + m * 60 + s;
-    }
-    if (parts.length === 2) {
-      const m = Number(parts[0]);
-      const s = Number(parts[1]);
-      if (![m, s].some(Number.isNaN)) return m * 60 + s;
-    }
-    const n = Number(clean);
-    if (!Number.isNaN(n) && n >= 0) return n;
-  }
-  return 0;
-}
-
 const upload = multer({
   dest: os.tmpdir(),
   limits: {
@@ -150,73 +115,108 @@ const upload = multer({
   },
 });
 
-async function runAnalyzeWithModel(
-  ai: GoogleGenAI,
-  model: string,
-  mediaPart: Record<string, unknown>,
-  promptText: string,
-  systemInstruction: string
-) {
-  return ai.models.generateContent({
-    model,
-    contents: {
-      parts: [mediaPart, { text: promptText }],
-    },
-    config: {
-      systemInstruction,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            id: {
-              type: Type.INTEGER,
-              description: 'Sequential segment index starting at 1',
-            },
-            startTime: {
-              type: Type.NUMBER,
-              description: 'Segment start time in seconds, e.g. 1.0',
-            },
-            endTime: {
-              type: Type.NUMBER,
-              description: 'Segment end time in seconds, e.g. 4.5',
-            },
-            originalText: {
-              type: Type.STRING,
-              description: 'Transcribed speech in the source language',
-            },
-            translatedText: {
-              type: Type.STRING,
-              description: 'Natural translation with syllable length proportional to segment duration',
-            },
-            words: {
-              type: Type.ARRAY,
-              description: 'Word-level timestamps for every word in translatedText',
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  word: {
-                    type: Type.STRING,
-                    description: 'Individual word token from translatedText',
-                  },
-                  start: {
-                    type: Type.NUMBER,
-                    description: 'Word start time in seconds within [startTime, endTime]',
-                  },
-                  end: {
-                    type: Type.NUMBER,
-                    description: 'Word end time in seconds within [startTime, endTime]',
-                  },
-                },
-                required: ['word', 'start', 'end'],
-              },
-            },
-          },
-          required: ['id', 'startTime', 'endTime', 'originalText', 'translatedText', 'words'],
-        },
-      },
-    },
+function runPythonAnalysis(payload: {
+  candidates: AiProviderRequestConfig[];
+  sourceLabel: string;
+  targetLabel: string;
+  media: {
+    filePath: string;
+    fileSize: number;
+    originalName: string;
+    mimeType: string;
+  };
+}): Promise<{
+  segments: Array<{
+    id: number;
+    startTime: string;
+    endTime: string;
+    originalText: string;
+    translatedText: string;
+    words: Array<{ word: string; start: number; end: number }>;
+  }>;
+  usedModel: string;
+  usedProvider: string;
+  fallbackUsed: boolean;
+  attemptCount: number;
+}> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(PYTHON_EXECUTABLE, [ANALYSIS_SCRIPT_PATH], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, 300000);
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      if (timedOut) {
+        reject(new Error('Waktu analisis Python habis. Coba lagi atau gunakan file yang lebih singkat.'));
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `Proses analisis Python berhenti dengan kode ${code}.`));
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout) as {
+          ok?: boolean;
+          error?: string;
+          httpStatus?: number;
+          segments?: Array<{
+            id: number;
+            startTime: string;
+            endTime: string;
+            originalText: string;
+            translatedText: string;
+            words: Array<{ word: string; start: number; end: number }>;
+          }>;
+          usedModel?: string;
+          usedProvider?: string;
+          fallbackUsed?: boolean;
+          attemptCount?: number;
+        };
+        if (!result.ok) {
+          const error = new Error(result.error || 'Gagal menganalisis media dengan Python.') as Error & {
+            httpStatus?: number;
+          };
+          error.httpStatus = result.httpStatus;
+          reject(error);
+          return;
+        }
+        resolve({
+          segments: result.segments ?? [],
+          usedModel: result.usedModel ?? '',
+          usedProvider: result.usedProvider ?? '',
+          fallbackUsed: result.fallbackUsed ?? false,
+          attemptCount: result.attemptCount ?? 1,
+        });
+      } catch {
+        reject(new Error('Respons proses analisis Python tidak valid.'));
+      }
+    });
+    child.stdin.on('error', (error) => {
+      clearTimeout(timeout);
+      child.kill();
+      reject(error);
+    });
+    child.stdin.end(JSON.stringify(payload));
   });
 }
 
@@ -257,187 +257,22 @@ async function startServer() {
     const aiConfig = parseAiConfigFromRequest(req.body?.aiConfig);
     const fallbackConfigs = parseFallbackConfigsFromRequest(req.body?.fallbackConfigs);
     const candidates = buildCandidateList(aiConfig, fallbackConfigs);
-
     const sourceLang = typeof req.body?.sourceLanguage === 'string' ? req.body.sourceLanguage : 'auto';
     const targetLang = typeof req.body?.targetLanguage === 'string' ? req.body.targetLanguage : 'id';
-    const sourceLabel = LANGUAGE_LABELS[sourceLang] ?? sourceLang;
-    const targetLabel = LANGUAGE_LABELS[targetLang] ?? targetLang;
-    const mimeType = normalizeMimeType(file.mimetype, file.originalname);
 
-    const normalizeAnalyzedSegments = (rawList: unknown[]) =>
-      rawList.map((rawItem, idx) => {
-        const item = (rawItem ?? {}) as {
-          id?: unknown;
-          startTime?: unknown;
-          endTime?: unknown;
-          originalText?: unknown;
-          translatedText?: unknown;
-          words?: unknown;
-        };
-        const startSec = parseSecondsServer(item.startTime);
-        const rawEnd = parseSecondsServer(item.endTime);
-        const endSec = rawEnd > startSec ? rawEnd : startSec + 2.5;
-        const words = Array.isArray(item.words)
-          ? item.words
-              .filter((w: unknown) => w && typeof (w as { word?: unknown }).word === 'string')
-              .map((w: { word: string; start?: number; end?: number }) => {
-                const ws = Math.max(startSec, Math.min(endSec, parseSecondsServer(w.start)));
-                const we = Math.max(ws + 0.05, Math.min(endSec, parseSecondsServer(w.end)));
-                return {
-                  word: String(w.word).trim(),
-                  start: Number(ws.toFixed(3)),
-                  end: Number(we.toFixed(3)),
-                };
-              })
-          : [];
-
-        return {
-          id: typeof item.id === 'number' ? item.id : idx + 1,
-          startTime: formatSecondsToTimestampServer(startSec),
-          endTime: formatSecondsToTimestampServer(endSec),
-          originalText: typeof item.originalText === 'string' ? item.originalText.trim() : '',
-          translatedText: typeof item.translatedText === 'string' ? item.translatedText.trim() : '',
-          words,
-        };
-      });
-
-    const analyzeWithSingleCandidate = async (candidate: AiProviderRequestConfig) => {
-      const resolvedModel = resolveAnalysisModelSelection({
-        provider: candidate.provider,
-        requestedModel: candidate.model,
-        hasMediaAttachment: true,
-      });
-
-      if (candidate.provider !== 'gemini_server' && candidate.provider !== 'gemini_custom') {
-        const rawSegments = await analyzeMediaWithOpenAiCompatible({
+    try {
+      const result = await runPythonAnalysis({
+        candidates,
+        sourceLabel: LANGUAGE_LABELS[sourceLang] ?? sourceLang,
+        targetLabel: LANGUAGE_LABELS[targetLang] ?? targetLang,
+        media: {
           filePath: file.path,
           fileSize: file.size,
           originalName: file.originalname,
-          mimeType,
-          sourceLabel,
-          targetLabel,
-          aiConfig: { ...candidate, model: resolvedModel },
-        });
-        return {
-          segments: normalizeAnalyzedSegments(rawSegments),
-          usedModel: resolvedModel,
-        };
-      }
-
-      const ai = await createGeminiClientForConfig(candidate);
-      if (!ai) {
-        throw new Error('GEMINI_API_KEY belum dikonfigurasi di server. Atur di panel Settings > Secrets.');
-      }
-
-      let uploadedFileName: string | null = null;
-      try {
-        let mediaPart: Record<string, unknown>;
-
-        if (file.size <= INLINE_THRESHOLD_BYTES) {
-          const buffer = await fs.promises.readFile(file.path);
-          mediaPart = {
-            inlineData: {
-              mimeType,
-              data: buffer.toString('base64'),
-            },
-          };
-        } else {
-          const uploaded = await ai.files.upload({
-            file: file.path,
-            config: { mimeType },
-          });
-          uploadedFileName = uploaded.name ?? null;
-
-          let currentFile = uploaded;
-          const startPoll = Date.now();
-          while (currentFile.state === 'PROCESSING') {
-            if (Date.now() - startPoll > 90000) {
-              throw new Error('Waktu pemrosesan file di Gemini File API habis.');
-            }
-            await new Promise((r) => setTimeout(r, 2000));
-            if (!currentFile.name) break;
-            currentFile = await ai.files.get({ name: currentFile.name });
-          }
-
-          if (currentFile.state === 'FAILED') {
-            throw new Error('Gemini File API gagal memproses file media ini.');
-          }
-
-          mediaPart = {
-            fileData: {
-              mimeType: currentFile.mimeType || mimeType,
-              fileUri: currentFile.uri,
-            },
-          };
-        }
-
-        const systemInstruction = [
-          'You are an expert audiovisual translator and dubbing script adapter.',
-          'Transcribe all spoken dialogue accurately into chronological segments with numeric startTime and endTime in seconds.',
-          'Translate each segment into the requested target language naturally.',
-          'CRITICAL DUBBING CONSTRAINT: Adjust the phrasing and syllable count of translatedText so that when spoken aloud at a normal pace, it fits proportionally inside (endTime - startTime).',
-          'CRITICAL WORD-LEVEL TIMESTAMPS: Include a "words" array for EVERY word in translatedText, with exact numeric "start" and "end" timestamps in seconds strictly ordered inside [startTime, endTime].',
-        ].join(' ');
-
-        const promptText = `Analyze this media. Source language hint: ${sourceLabel}. Target translation language: ${targetLabel}. Return the structured JSON array of segments including word-level timestamps ("words") for translatedText.`;
-
-        let usedAnalyzeModel = resolvedModel;
-        let response;
-        try {
-          response = await runAnalyzeWithModel(
-            ai,
-            resolvedModel,
-            mediaPart,
-            promptText,
-            systemInstruction
-          );
-        } catch (primaryErr) {
-          const msg = primaryErr instanceof Error ? primaryErr.message.toLowerCase() : '';
-          if (
-            candidate.provider === 'gemini_server' &&
-            (msg.includes('not_found') || msg.includes('404') || msg.includes('not found'))
-          ) {
-            usedAnalyzeModel = 'gemini-4-hydrogen';
-            response = await runAnalyzeWithModel(
-              ai,
-              usedAnalyzeModel,
-              mediaPart,
-              promptText,
-              systemInstruction
-            );
-          } else {
-            throw primaryErr;
-          }
-        }
-
-        const rawText = (response.text ?? '[]').trim();
-        const parsed = JSON.parse(rawText);
-        if (!Array.isArray(parsed)) {
-          throw new Error('Format respons Gemini tidak berupa array segmen.');
-        }
-
-        return {
-          segments: normalizeAnalyzedSegments(parsed),
-          usedModel: usedAnalyzeModel,
-        };
-      } finally {
-        if (uploadedFileName) {
-          await ai.files.delete({ name: uploadedFileName }).catch(() => {});
-        }
-      }
-    };
-
-    try {
-      const outcome = await runWithServerFallback(candidates, (candidate) =>
-        analyzeWithSingleCandidate(candidate)
-      );
-      res.json({
-        segments: outcome.result.segments,
-        usedModel: outcome.result.usedModel,
-        usedProvider: getProviderDisplayName(outcome.usedConfig.provider),
-        fallbackUsed: outcome.fallbackUsed,
-        attemptCount: outcome.attemptIndex + 1,
+          mimeType: normalizeMimeType(file.mimetype, file.originalname),
+        },
       });
+      res.json(result);
     } catch (err) {
       const httpStatus = (err as { httpStatus?: number }).httpStatus;
       if (httpStatus) {
